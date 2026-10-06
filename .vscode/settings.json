@@ -1,0 +1,10 @@
+{
+    "platformio-ide.activateProjectOnStartup": true,
+    "platformio-ide.autoRebuildAutocompleteCache": true,
+    "editor.formatOnSave": true,
+    "files.associations": {
+        "*.h": "cpp",
+        "*.cpp": "cpp",
+        "*.ino": "cpp"
+    }
+}
