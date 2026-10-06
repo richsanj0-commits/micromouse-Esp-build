@@ -35,9 +35,9 @@
 // MOTOR FUNCTIONS
 // ==========================================
 void forward(int speed) {
-    // Left motor forward
-    digitalWrite(AIN1, HIGH);
-    digitalWrite(AIN2, LOW);
+    // Left motor forward (inverted)
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
     ledcWrite(CH_LEFT, speed);
 
     // Right motor forward
@@ -47,9 +47,9 @@ void forward(int speed) {
 }
 
 void backward(int speed) {
-    // Left motor backward
-    digitalWrite(AIN1, LOW);
-    digitalWrite(AIN2, HIGH);
+    // Left motor backward (inverted)
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
     ledcWrite(CH_LEFT, speed);
 
     // Right motor backward
