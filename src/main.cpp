@@ -1,267 +1,115 @@
 #include <Arduino.h>
-#include "pinout.h"
-#include "motor.h"
 
-// =============================================================================
-// MICROMOUSE MOTOR TEST PROGRAM
-// =============================================================================
+// ==========================================
+// PIN DEFINITIONS
+// ==========================================
+#define PWMA 27
+#define AIN1 14
+#define AIN2 26
+#define PWMB 32
+#define BIN1 25
+#define BIN2 33
 
-// Default test speed (0 - 255)
-int testSpeed = 150;
+#define L_ENC_A 36
+#define L_ENC_B 39
+#define R_ENC_A 34
+#define R_ENC_B 35
 
-// State machine for automated forward/backward sequence
-enum TestState {
-    STATE_IDLE,
-    STATE_ARMED,
-    STATE_FORWARD,
-    STATE_PAUSE1,
-    STATE_BACKWARD,
-    STATE_PAUSE2,
-    STATE_COMPLETE
-};
+#define I2C_SDA 21
+#define I2C_SCL 22
 
-TestState currentState = STATE_IDLE;
-unsigned long stateStartTime = 0;
-unsigned long lastLedToggle = 0;
-bool ledState = false;
+#define XSHUT_L  23
+#define XSHUT_LF 19
+#define XSHUT_F  18
+#define XSHUT_RF 17
+#define XSHUT_R  16
 
-// Button debounce helpers
-bool lastBtn1State = HIGH;
-bool lastBtn2State = HIGH;
-unsigned long lastDebounceTime1 = 0;
-unsigned long lastDebounceTime2 = 0;
-const unsigned long debounceDelay = 50;
+#define BTN1 4
+#define BTN2 13
 
-void printMenu() {
-    Serial.println("\n==============================================");
-    Serial.println("       MICROMOUSE ESP32 - MOTOR TEST          ");
-    Serial.println("==============================================");
-    Serial.println("Hardware Pin Mapping:");
-    Serial.println("  Left Motor  : PWMA=27, AIN1=14, AIN2=26");
-    Serial.println("  Right Motor : PWMB=32, BIN1=25, BIN2=33");
-    Serial.println("  Buttons     : BTN1=GPIO4, BTN2=GPIO13");
-    Serial.println("  Status LED  : GPIO2");
-    Serial.println("----------------------------------------------");
-    Serial.printf("Current Test Speed: %d / 255\n", testSpeed);
-    Serial.println("Commands (via Serial Monitor):");
-    Serial.println("  't' : Run Auto Test (Forward -> Brake -> Backward -> Stop)");
-    Serial.println("  'f' : Drive Forward");
-    Serial.println("  'b' : Drive Backward");
-    Serial.println("  'l' : Turn Left");
-    Serial.println("  'r' : Turn Right");
-    Serial.println("  's' : Stop / Dynamic Brake");
-    Serial.println("  '+' : Increase Speed by 15");
-    Serial.println("  '-' : Decrease Speed by 15");
-    Serial.println("Hardware Buttons:");
-    Serial.println("  BTN1 (GPIO4)  : Start Auto Test Sequence");
-    Serial.println("  BTN2 (GPIO13) : Emergency STOP");
-    Serial.println("==============================================\n");
+// PWM Channels for ESP32
+#define CH_LEFT  0
+#define CH_RIGHT 1
+
+// ==========================================
+// MOTOR FUNCTIONS
+// ==========================================
+void forward(int speed) {
+    // Left motor forward
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+    ledcWrite(CH_LEFT, speed);
+
+    // Right motor forward
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+    ledcWrite(CH_RIGHT, speed);
 }
 
-void startAutoTest() {
-    Serial.println("\n[AUTO TEST] Arming test sequence in 1 second...");
-    currentState = STATE_ARMED;
-    stateStartTime = millis();
+void backward(int speed) {
+    // Left motor backward
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+    ledcWrite(CH_LEFT, speed);
+
+    // Right motor backward
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+    ledcWrite(CH_RIGHT, speed);
 }
 
-void stopAll() {
-    motorBrake();
-    currentState = STATE_IDLE;
-    digitalWrite(LED_PIN, LOW);
-    Serial.println("[MOTORS] STOPPED (Brake Engaged)");
+void stopMotors() {
+    // Active brake
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, HIGH);
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, HIGH);
+    ledcWrite(CH_LEFT, 0);
+    ledcWrite(CH_RIGHT, 0);
 }
 
-void handleSerialCommands() {
-    if (!Serial.available()) return;
-
-    char cmd = Serial.read();
-    switch (cmd) {
-        case 't':
-        case 'T':
-            startAutoTest();
-            break;
-
-        case 'f':
-        case 'F':
-            currentState = STATE_IDLE;
-            Serial.printf("[MOTORS] Moving FORWARD at speed %d\n", testSpeed);
-            motorForward(testSpeed);
-            break;
-
-        case 'b':
-        case 'B':
-            currentState = STATE_IDLE;
-            Serial.printf("[MOTORS] Moving BACKWARD at speed %d\n", testSpeed);
-            motorBackward(testSpeed);
-            break;
-
-        case 'l':
-        case 'L':
-            currentState = STATE_IDLE;
-            Serial.printf("[MOTORS] Turning LEFT at speed %d\n", testSpeed);
-            motorTurnLeft(testSpeed);
-            break;
-
-        case 'r':
-        case 'R':
-            currentState = STATE_IDLE;
-            Serial.printf("[MOTORS] Turning RIGHT at speed %d\n", testSpeed);
-            motorTurnRight(testSpeed);
-            break;
-
-        case 's':
-        case 'S':
-        case ' ':
-            stopAll();
-            break;
-
-        case '+':
-        case '=':
-            testSpeed = min(255, testSpeed + 15);
-            Serial.printf("[CONFIG] Speed increased to: %d\n", testSpeed);
-            break;
-
-        case '-':
-        case '_':
-            testSpeed = max(30, testSpeed - 15);
-            Serial.printf("[CONFIG] Speed decreased to: %d\n", testSpeed);
-            break;
-
-        case 'h':
-        case 'H':
-        case '?':
-            printMenu();
-            break;
-
-        default:
-            break;
-    }
-}
-
-void handleButtons() {
-    // Read raw button states (Active LOW due to INPUT_PULLUP)
-    int reading1 = digitalRead(BTN1);
-    int reading2 = digitalRead(BTN2);
-
-    // Button 1 debounce (Start Test)
-    if (reading1 != lastBtn1State) {
-        lastDebounceTime1 = millis();
-    }
-    if ((millis() - lastDebounceTime1) > debounceDelay) {
-        if (reading1 == LOW && lastBtn1State == HIGH) {
-            Serial.println("\n[BUTTON 1 PRESSED] Starting Auto Test...");
-            startAutoTest();
-        }
-    }
-    lastBtn1State = reading1;
-
-    // Button 2 debounce (Emergency Stop)
-    if (reading2 != lastBtn2State) {
-        lastDebounceTime2 = millis();
-    }
-    if ((millis() - lastDebounceTime2) > debounceDelay) {
-        if (reading2 == LOW && lastBtn2State == HIGH) {
-            Serial.println("\n[BUTTON 2 PRESSED] Emergency Stop Triggered!");
-            stopAll();
-        }
-    }
-    lastBtn2State = reading2;
-}
-
-void updateAutoTest() {
-    unsigned long now = millis();
-
-    switch (currentState) {
-        case STATE_IDLE:
-            // Heartbeat blink when idle (1 Hz)
-            if (now - lastLedToggle >= 500) {
-                lastLedToggle = now;
-                ledState = !ledState;
-                digitalWrite(LED_PIN, ledState);
-            }
-            break;
-
-        case STATE_ARMED:
-            // Fast blink during arming countdown
-            if (now - lastLedToggle >= 100) {
-                lastLedToggle = now;
-                ledState = !ledState;
-                digitalWrite(LED_PIN, ledState);
-            }
-            if (now - stateStartTime >= 1000) {
-                Serial.printf("[AUTO TEST] PHASE 1: FORWARD at speed %d (1.5 sec)\n", testSpeed);
-                motorForward(testSpeed);
-                digitalWrite(LED_PIN, HIGH);
-                currentState = STATE_FORWARD;
-                stateStartTime = now;
-            }
-            break;
-
-        case STATE_FORWARD:
-            if (now - stateStartTime >= 1500) {
-                Serial.println("[AUTO TEST] PHASE 2: BRAKE PAUSE (0.5 sec)");
-                motorBrake();
-                digitalWrite(LED_PIN, LOW);
-                currentState = STATE_PAUSE1;
-                stateStartTime = now;
-            }
-            break;
-
-        case STATE_PAUSE1:
-            if (now - stateStartTime >= 500) {
-                Serial.printf("[AUTO TEST] PHASE 3: BACKWARD at speed %d (1.5 sec)\n", testSpeed);
-                motorBackward(testSpeed);
-                digitalWrite(LED_PIN, HIGH);
-                currentState = STATE_BACKWARD;
-                stateStartTime = now;
-            }
-            break;
-
-        case STATE_BACKWARD:
-            if (now - stateStartTime >= 1500) {
-                Serial.println("[AUTO TEST] PHASE 4: FINAL BRAKE");
-                motorBrake();
-                digitalWrite(LED_PIN, LOW);
-                currentState = STATE_PAUSE2;
-                stateStartTime = now;
-            }
-            break;
-
-        case STATE_PAUSE2:
-            if (now - stateStartTime >= 500) {
-                Serial.println("[AUTO TEST] Sequence Complete! Robot stopped.\n");
-                stopAll();
-            }
-            break;
-
-        case STATE_COMPLETE:
-            stopAll();
-            break;
-    }
-}
-
+// ==========================================
+// SETUP & LOOP
+// ==========================================
 void setup() {
-    // 1. Initialize Serial Communication
     Serial.begin(115200);
-    delay(200);
 
-    // 2. Initialize Status LED
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, LOW);
+    // Direction pins
+    pinMode(AIN1, OUTPUT);
+    pinMode(AIN2, OUTPUT);
+    pinMode(BIN1, OUTPUT);
+    pinMode(BIN2, OUTPUT);
 
-    // 3. Initialize User Buttons with internal pullups
+    // Buttons
     pinMode(BTN1, INPUT_PULLUP);
     pinMode(BTN2, INPUT_PULLUP);
 
-    // 4. Initialize Motor Driver pins and PWM
-    motorInit();
+    // Configure 20kHz PWM on ESP32
+    ledcSetup(CH_LEFT, 20000, 8);
+    ledcAttachPin(PWMA, CH_LEFT);
 
-    // 5. Print startup diagnostics and instructions
-    printMenu();
+    ledcSetup(CH_RIGHT, 20000, 8);
+    ledcAttachPin(PWMB, CH_RIGHT);
+
+    stopMotors();
+    Serial.println("ESP32 Micromouse Ready! Starting in 2 seconds...");
+    delay(2000);
 }
 
 void loop() {
-    handleSerialCommands();
-    handleButtons();
-    updateAutoTest();
+    Serial.println("Moving FORWARD...");
+    forward(150);      // Speed between 0 and 255
+    delay(2000);
+
+    Serial.println("STOP");
+    stopMotors();
+    delay(1000);
+
+    Serial.println("Moving BACKWARD...");
+    backward(150);
+    delay(2000);
+
+    Serial.println("STOP");
+    stopMotors();
+    delay(2000);
 }
