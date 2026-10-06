@@ -1,22 +1,12 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <VL53L0X.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 // ==========================================
 // PIN DEFINITIONS
 // ==========================================
-#define PWMA 27
-#define AIN1 14
-#define AIN2 26
-#define PWMB 32
-#define BIN1 25
-#define BIN2 33
-
-#define L_ENC_A 36
-#define L_ENC_B 39
-#define R_ENC_A 34
-#define R_ENC_B 35
-
 #define I2C_SDA 21
 #define I2C_SCL 22
 
@@ -25,9 +15,6 @@
 #define XSHUT_F  18
 #define XSHUT_RF 17
 #define XSHUT_R  16
-
-#define BTN1 4
-#define BTN2 13
 
 // Sensor I2C Addresses
 #define ADDR_L   0x30
@@ -43,83 +30,120 @@ VL53L0X sensorF;
 VL53L0X sensorRF;
 VL53L0X sensorR;
 
+bool okL  = false;
+bool okLF = false;
+bool okF  = false;
+bool okRF = false;
+bool okR  = false;
+
 void initSensors() {
     Wire.begin(I2C_SDA, I2C_SCL);
-    Wire.setClock(400000); // 400kHz I2C speed
+    Wire.setClock(100000); // 100kHz standard speed for stable lines
 
-    // 1. Reset all sensors by setting XSHUT LOW
-    pinMode(XSHUT_L, OUTPUT);
-    pinMode(XSHUT_LF, OUTPUT);
-    pinMode(XSHUT_F, OUTPUT);
-    pinMode(XSHUT_RF, OUTPUT);
-    pinMode(XSHUT_R, OUTPUT);
+    // Configure all XSHUT as open-drain (high-z when releasing, pull low to reset)
+    pinMode(XSHUT_L, OUTPUT_OPEN_DRAIN);
+    pinMode(XSHUT_LF, OUTPUT_OPEN_DRAIN);
+    pinMode(XSHUT_F, OUTPUT_OPEN_DRAIN);
+    pinMode(XSHUT_RF, OUTPUT_OPEN_DRAIN);
+    pinMode(XSHUT_R, OUTPUT_OPEN_DRAIN);
 
+    // Keep all sensors in hardware standby
     digitalWrite(XSHUT_L, LOW);
     digitalWrite(XSHUT_LF, LOW);
     digitalWrite(XSHUT_F, LOW);
     digitalWrite(XSHUT_RF, LOW);
     digitalWrite(XSHUT_R, LOW);
-    delay(20);
+    delay(50);
 
-    // 2. Initialize Left Sensor
+    // 1. Left Sensor (release reset with HIGH / floating input)
     digitalWrite(XSHUT_L, HIGH);
-    delay(10);
+    delay(30);
     sensorL.setTimeout(500);
-    if (!sensorL.init()) Serial.println("Failed to init Left ToF!");
-    sensorL.setAddress(ADDR_L);
-    sensorL.startContinuous(50);
+    if (sensorL.init()) {
+        sensorL.setAddress(ADDR_L);
+        sensorL.startContinuous(50);
+        okL = true;
+        Serial.println("Left ToF: OK");
+    } else {
+        Serial.println("Left ToF: FAILED");
+    }
+    delay(30);
 
-    // 3. Initialize Left-Front Sensor
+    // 2. Left-Front Sensor
     digitalWrite(XSHUT_LF, HIGH);
-    delay(10);
+    delay(30);
     sensorLF.setTimeout(500);
-    if (!sensorLF.init()) Serial.println("Failed to init Left-Front ToF!");
-    sensorLF.setAddress(ADDR_LF);
-    sensorLF.startContinuous(50);
+    if (sensorLF.init()) {
+        sensorLF.setAddress(ADDR_LF);
+        sensorLF.startContinuous(50);
+        okLF = true;
+        Serial.println("Left-Front ToF: OK");
+    } else {
+        Serial.println("Left-Front ToF: FAILED");
+    }
+    delay(30);
 
-    // 4. Initialize Front Sensor
+    // 3. Front Sensor
     digitalWrite(XSHUT_F, HIGH);
-    delay(10);
+    delay(30);
     sensorF.setTimeout(500);
-    if (!sensorF.init()) Serial.println("Failed to init Front ToF!");
-    sensorF.setAddress(ADDR_F);
-    sensorF.startContinuous(50);
+    if (sensorF.init()) {
+        sensorF.setAddress(ADDR_F);
+        sensorF.startContinuous(50);
+        okF = true;
+        Serial.println("Front ToF: OK");
+    } else {
+        Serial.println("Front ToF: FAILED");
+    }
+    delay(30);
 
-    // 5. Initialize Right-Front Sensor
+    // 4. Right-Front Sensor
     digitalWrite(XSHUT_RF, HIGH);
-    delay(10);
+    delay(30);
     sensorRF.setTimeout(500);
-    if (!sensorRF.init()) Serial.println("Failed to init Right-Front ToF!");
-    sensorRF.setAddress(ADDR_RF);
-    sensorRF.startContinuous(50);
+    if (sensorRF.init()) {
+        sensorRF.setAddress(ADDR_RF);
+        sensorRF.startContinuous(50);
+        okRF = true;
+        Serial.println("Right-Front ToF: OK");
+    } else {
+        Serial.println("Right-Front ToF: FAILED");
+    }
+    delay(30);
 
-    // 6. Initialize Right Sensor
+    // 5. Right Sensor
     digitalWrite(XSHUT_R, HIGH);
-    delay(10);
+    delay(30);
     sensorR.setTimeout(500);
-    if (!sensorR.init()) Serial.println("Failed to init Right ToF!");
-    sensorR.setAddress(ADDR_R);
-    sensorR.startContinuous(50);
-
-    Serial.println("All 5 ToF sensors initialized successfully!");
+    if (sensorR.init()) {
+        sensorR.setAddress(ADDR_R);
+        sensorR.startContinuous(50);
+        okR = true;
+        Serial.println("Right ToF: OK");
+    } else {
+        Serial.println("Right ToF: FAILED");
+    }
+    delay(30);
 }
 
 void setup() {
-    Serial.begin(115200);
-    delay(500);
+    // Disable ESP32 brownout detector for USB development/power dips
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
-    Serial.println("\n--- 5-ToF Sensor Monitor Starting ---");
+    Serial.begin(115200);
+    delay(1000);
+
+    Serial.println("\n--- 5-ToF Sensor Initialization ---");
     initSensors();
 }
 
 void loop() {
-    uint16_t dL  = sensorL.readRangeContinuousMillimeters();
-    uint16_t dLF = sensorLF.readRangeContinuousMillimeters();
-    uint16_t dF  = sensorF.readRangeContinuousMillimeters();
-    uint16_t dRF = sensorRF.readRangeContinuousMillimeters();
-    uint16_t dR  = sensorR.readRangeContinuousMillimeters();
+    uint16_t dL  = okL  ? sensorL.readRangeContinuousMillimeters()  : 9999;
+    uint16_t dLF = okLF ? sensorLF.readRangeContinuousMillimeters() : 9999;
+    uint16_t dF  = okF  ? sensorF.readRangeContinuousMillimeters()  : 9999;
+    uint16_t dRF = okRF ? sensorRF.readRangeContinuousMillimeters() : 9999;
+    uint16_t dR  = okR  ? sensorR.readRangeContinuousMillimeters()  : 9999;
 
-    // Formatted readable output (in mm)
     Serial.printf("L: %4d mm | LF: %4d mm | F: %4d mm | RF: %4d mm | R: %4d mm\n",
                   dL, dLF, dF, dRF, dR);
 
