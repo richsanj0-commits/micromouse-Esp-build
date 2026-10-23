@@ -3,7 +3,8 @@
 Simple single-file project setup for ESP32 (38-pin module).
 
 - **GitHub Repository**: [richsanj0-commits/micromouse-Esp-build](https://github.com/richsanj0-commits/micromouse-Esp-build)
-- **Code**: [`src/main.cpp`](src/main.cpp)
+- **Active Code**: [`src/main.cpp`](src/main.cpp)
+- **Wireless Web Telemetry**: [`apexweb.cpp`](apexweb.cpp)
 
 ---
 
@@ -11,8 +12,11 @@ Simple single-file project setup for ESP32 (38-pin module).
 
 ```
 D:\MazeSolver\
+├── apexweb.cpp              # Complete standalone wireless web telemetry setup (alienware hotspot)
 ├── src/
-│   └── main.cpp             # All pin defines & motor forward/backward code
+│   └── main.cpp             # Active PlatformIO build source
+├── include/
+│   └── dashboard_html.h     # High-tech dark mode responsive telemetry web dashboard
 ├── platformio.ini           # ESP32 board configuration
 └── README.md
 ```
