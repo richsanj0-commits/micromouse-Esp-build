@@ -9,7 +9,7 @@
 #define L_ENC_B 35
 #define R_ENC_A 36
 #define R_ENC_B 39
-#define L_ENC_DIR -1   // forward = positive
+#define L_ENC_DIR  1   // forward = positive (checked with motors driving, 2026-10-27)
 #define R_ENC_DIR -1
 
 const float CPR_LEFT  = 2772.1f;   // counts per wheel revolution

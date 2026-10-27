@@ -37,7 +37,7 @@
 #define R_ENC_B 39
 
 // Verified on robot: both counted negative rolling forward -> inverted
-#define L_ENC_DIR -1
+#define L_ENC_DIR  1
 #define R_ENC_DIR -1
 
 // Buttons

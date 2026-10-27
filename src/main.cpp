@@ -1,404 +1,348 @@
+// =========================================================================
+// DRIVE DISTANCE TEST
+//   BTN1 (GPIO 13) -> both wheels FORWARD 2000 counts (~77 mm)
+//   BTN2 (GPIO 4)  -> both wheels BACKWARD 2000 counts (back to start)
+// Waits 1 s after the press so your hand is clear, then drives straight
+// (keeps left/right counts equal), slows down near the end and brakes.
+//
+// WIRELESS: joins the "alienware" hotspot. Output goes to USB serial AND to
+// a WiFi terminal on port 23 (no cable needed):
+//   pio device monitor --port socket://micromouse.local:23
+// Commands over WiFi or USB (type + Enter):
+//   1 = fwd 2000 counts   2 = back 2000 counts   c<n> = n counts (c-500 = back)   d<mm> = mm
+// =========================================================================
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>
 #include <ESPmDNS.h>
-#include <Wire.h>
-#include <VL53L0X.h>
+#include "soc/gpio_struct.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
-#include "dashboard_html.h"
+#include "robot_config.h"
 
-// =========================================================================
-// WI-FI STATION CONFIGURATION (HOTSPOT ONLY)
-// =========================================================================
-const char* WIFI_SSID = "alienware";
-const char* WIFI_PASS = "12345678";
+// --- WIFI ---
+#include "wifi_secrets.h"  // local only, see wifi_secrets.example.h
+const char* WIFI_SSID = WIFI_SSID_VALUE;
+const char* WIFI_PASS = WIFI_PASS_VALUE;
+const char* HOSTNAME  = "micromouse";
 
-WebServer server(80);
-String currentNetInfo = "Connecting to alienware...";
+WiFiServer telnetServer(23);
+WiFiClient telnet;
 
-// =========================================================================
-// PIN DEFINITIONS
-// =========================================================================
-#define I2C_SDA   21
-#define I2C_SCL   22
-
-// XSHUT Shutdown Pins for 5x VL53L0X ToF
-#define XSHUT_L   23
-#define XSHUT_LF  19
-#define XSHUT_F   18
-#define XSHUT_RF  17
-#define XSHUT_R   16
-
-// I2C Unique Sensor Addresses
-#define ADDR_L    0x30
-#define ADDR_LF   0x31
-#define ADDR_F    0x32
-#define ADDR_RF   0x33
-#define ADDR_R    0x34
-
-// Quadrature Encoders
-#define L_ENC_A   36
-#define L_ENC_B   39
-#define R_ENC_A   34
-#define R_ENC_B   35
-
-// Buttons & Status LED
-#define BTN1      4    // Press to zero tick counters
-#define BTN2      13
-#define LED_PIN   2
-
-// =========================================================================
-// GLOBALS & SENSORS
-// =========================================================================
-VL53L0X sensorL;
-VL53L0X sensorLF;
-VL53L0X sensorF;
-VL53L0X sensorRF;
-VL53L0X sensorR;
-
-bool okL  = false;
-bool okLF = false;
-bool okF  = false;
-bool okRF = false;
-bool okR  = false;
-
-uint16_t distL  = 9999;
-uint16_t distLF = 9999;
-uint16_t distF  = 9999;
-uint16_t distRF = 9999;
-uint16_t distR  = 9999;
-
-// 64-bit atomic tick counters
-volatile int64_t leftTicks  = 0;
-volatile int64_t rightTicks = 0;
-
-void IRAM_ATTR isrLeftEncoder() {
-    int a = digitalRead(L_ENC_A);
-    int b = digitalRead(L_ENC_B);
-    if (a == b) leftTicks++;
-    else        leftTicks--;
+// Print to USB serial and to the WiFi terminal (if connected)
+void logf(const char *fmt, ...) {
+  char buf[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  Serial.print(buf);
+  if (telnet && telnet.connected()) telnet.print(buf);
 }
 
-void IRAM_ATTR isrRightEncoder() {
-    int a = digitalRead(R_ENC_A);
-    int b = digitalRead(R_ENC_B);
-    if (a == b) rightTicks++;
-    else        rightTicks--;
+void setupWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(HOSTNAME);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("WiFi: connecting to %s", WIFI_SSID);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+    delay(250);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    MDNS.begin(HOSTNAME);
+    telnetServer.begin();
+    telnetServer.setNoDelay(true);
+    Serial.printf("\nWiFi OK: %s  (telnet port 23, %s.local)\n",
+                  WiFi.localIP().toString().c_str(), HOSTNAME);
+  } else {
+    Serial.println("\nWiFi not found - buttons still work, output on USB only");
+  }
 }
 
-// =========================================================================
-// WIRELESS SERIAL LOG RING BUFFER
-// =========================================================================
-#define LOG_BUFFER_SIZE 30
-struct LogEntry {
-    uint32_t seq;
-    String message;
+// Accept a new WiFi terminal and read commands from USB or WiFi
+String inputLine;
+
+bool readCommand(String &cmd) {
+  if (telnetServer.hasClient()) {
+    if (telnet && telnet.connected()) telnet.stop();
+    telnet = telnetServer.available();
+    logf("WiFi terminal connected. Commands: 1 = fwd 2000, 2 = back 2000, c<counts>, d<mm>, t\n");
+  }
+  while (Serial.available() || (telnet && telnet.available())) {
+    char c = Serial.available() ? Serial.read() : telnet.read();
+    if (c == 13 || c == 10) {  // Enter (CR / LF)
+      if (inputLine.length() == 0) continue;
+      cmd = inputLine;
+      cmd.trim();
+      cmd.toLowerCase();
+      inputLine = "";
+      return true;
+    }
+    if (isPrintable(c) && inputLine.length() < 20) inputLine += c;
+  }
+  return false;
+}
+
+// --- PIN DEFINITIONS ---
+// Motor Driver (TB6612)
+#define PWMA 27
+#define AIN1 14
+#define AIN2 26
+#define PWMB 32
+#define BIN1 25
+#define BIN2 33
+
+// Buttons
+#define BTN1 13
+#define BTN2 4
+
+const int pwmFreq = 5000;
+const int pwmChannelLeft = 0;
+const int pwmChannelRight = 1;
+const int pwmResolution = 8; // 0-255
+
+// --- DRIVE TUNING ---
+const int   MAX_PWM   = 90;    // cruise speed
+const int   MIN_PWM   = 45;    // slowest speed that still moves the robot
+const float SLOW_MM   = 25.0f; // start slowing down this far before the target
+const float KP_STRAIGHT = 0.6f; // PWM per count of left/right difference
+
+// --- ENCODERS (4x quadrature, same as calibration sketch) ---
+volatile int32_t leftCount = 0;
+volatile int32_t rightCount = 0;
+volatile uint8_t leftState = 0;
+volatile uint8_t rightState = 0;
+
+static const int8_t QDEC[16] = {
+   0, -1,  1,  0,
+   1,  0,  0, -1,
+  -1,  0,  0,  1,
+   0,  1, -1,  0
 };
 
-LogEntry logBuffer[LOG_BUFFER_SIZE];
-int logHead = 0;
-int logCount = 0;
-uint32_t currentLogSeq = 0;
-
-void logMessage(const String& msg) {
-    Serial.println(msg);
-    currentLogSeq++;
-    logBuffer[logHead].seq = currentLogSeq;
-    logBuffer[logHead].message = msg;
-    logHead = (logHead + 1) % LOG_BUFFER_SIZE;
-    if (logCount < LOG_BUFFER_SIZE) {
-        logCount++;
-    }
+static inline uint8_t IRAM_ATTR readAB(uint8_t pinA, uint8_t pinB) {
+  uint32_t in = GPIO.in1.val;
+  return (((in >> (pinA - 32)) & 1) << 1) | ((in >> (pinB - 32)) & 1);
 }
 
-// =========================================================================
-// TOF SENSOR HARDWARE INITIALIZATION
-// =========================================================================
-void initToFSensors() {
-    Wire.begin(I2C_SDA, I2C_SCL);
-    Wire.setClock(100000); // 100kHz standard stable speed
-
-    pinMode(XSHUT_L, OUTPUT_OPEN_DRAIN);
-    pinMode(XSHUT_LF, OUTPUT_OPEN_DRAIN);
-    pinMode(XSHUT_F, OUTPUT_OPEN_DRAIN);
-    pinMode(XSHUT_RF, OUTPUT_OPEN_DRAIN);
-    pinMode(XSHUT_R, OUTPUT_OPEN_DRAIN);
-
-    // Keep all sensors in hardware standby
-    digitalWrite(XSHUT_L, LOW);
-    digitalWrite(XSHUT_LF, LOW);
-    digitalWrite(XSHUT_F, LOW);
-    digitalWrite(XSHUT_RF, LOW);
-    digitalWrite(XSHUT_R, LOW);
-    delay(40);
-
-    // 1. Left Sensor
-    digitalWrite(XSHUT_L, HIGH);
-    delay(25);
-    sensorL.setTimeout(200);
-    if (sensorL.init()) {
-        sensorL.setAddress(ADDR_L);
-        sensorL.startContinuous(50);
-        okL = true;
-        logMessage("[ToF] Left Sensor (0x30): OK");
-    } else {
-        logMessage("[ToF] Left Sensor: NOT DETECTED");
-    }
-    delay(20);
-
-    // 2. Left-Front Sensor
-    digitalWrite(XSHUT_LF, HIGH);
-    delay(25);
-    sensorLF.setTimeout(200);
-    if (sensorLF.init()) {
-        sensorLF.setAddress(ADDR_LF);
-        sensorLF.startContinuous(50);
-        okLF = true;
-        logMessage("[ToF] Left-Front (0x31): OK");
-    } else {
-        logMessage("[ToF] Left-Front: NOT DETECTED");
-    }
-    delay(20);
-
-    // 3. Front Sensor
-    digitalWrite(XSHUT_F, HIGH);
-    delay(25);
-    sensorF.setTimeout(200);
-    if (sensorF.init()) {
-        sensorF.setAddress(ADDR_F);
-        sensorF.startContinuous(50);
-        okF = true;
-        logMessage("[ToF] Front Sensor (0x32): OK");
-    } else {
-        logMessage("[ToF] Front Sensor: NOT DETECTED");
-    }
-    delay(20);
-
-    // 4. Right-Front Sensor
-    digitalWrite(XSHUT_RF, HIGH);
-    delay(25);
-    sensorRF.setTimeout(200);
-    if (sensorRF.init()) {
-        sensorRF.setAddress(ADDR_RF);
-        sensorRF.startContinuous(50);
-        okRF = true;
-        logMessage("[ToF] Right-Front (0x33): OK");
-    } else {
-        logMessage("[ToF] Right-Front: NOT DETECTED");
-    }
-    delay(20);
-
-    // 5. Right Sensor
-    digitalWrite(XSHUT_R, HIGH);
-    delay(25);
-    sensorR.setTimeout(200);
-    if (sensorR.init()) {
-        sensorR.setAddress(ADDR_R);
-        sensorR.startContinuous(50);
-        okR = true;
-        logMessage("[ToF] Right Sensor (0x34): OK");
-    } else {
-        logMessage("[ToF] Right Sensor: NOT DETECTED");
-    }
-    delay(20);
+void IRAM_ATTR leftEncoderISR() {
+  uint8_t s = readAB(L_ENC_A, L_ENC_B);
+  leftCount += QDEC[(leftState << 2) | s] * L_ENC_DIR;
+  leftState = s;
 }
 
-// =========================================================================
-// HTTP SERVER HANDLERS
-// =========================================================================
-void handleRoot() {
-    server.send_P(200, "text/html", DASHBOARD_HTML);
+void IRAM_ATTR rightEncoderISR() {
+  uint8_t s = readAB(R_ENC_A, R_ENC_B);
+  rightCount += QDEC[(rightState << 2) | s] * R_ENC_DIR;
+  rightState = s;
 }
 
-void handleTelemetry() {
-    uint32_t since = 0;
-    if (server.hasArg("since")) {
-        since = (uint32_t)server.arg("since").toInt();
+void readCounts(int32_t &l, int32_t &r) {
+  noInterrupts();
+  l = leftCount;
+  r = rightCount;
+  interrupts();
+}
+
+void zeroCounts() {
+  noInterrupts();
+  leftCount = 0;
+  rightCount = 0;
+  interrupts();
+}
+
+// --- MOTORS ---
+void setupMotors() {
+  pinMode(AIN1, OUTPUT);
+  pinMode(AIN2, OUTPUT);
+  pinMode(BIN1, OUTPUT);
+  pinMode(BIN2, OUTPUT);
+
+  ledcSetup(pwmChannelLeft, pwmFreq, pwmResolution);
+  ledcSetup(pwmChannelRight, pwmFreq, pwmResolution);
+
+  ledcAttachPin(PWMA, pwmChannelLeft);
+  ledcAttachPin(PWMB, pwmChannelRight);
+}
+
+void setMotorLeft(int speed) {
+  speed = constrain(speed, -255, 255);
+  if (speed > 0) {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, HIGH);
+    ledcWrite(pwmChannelLeft, speed);
+  } else if (speed < 0) {
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+    ledcWrite(pwmChannelLeft, -speed);
+  } else {
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, LOW);
+    ledcWrite(pwmChannelLeft, 0);
+  }
+}
+
+void setMotorRight(int speed) {
+  speed = constrain(speed, -255, 255);
+  if (speed > 0) {
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+    ledcWrite(pwmChannelRight, speed);
+  } else if (speed < 0) {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, HIGH);
+    ledcWrite(pwmChannelRight, -speed);
+  } else {
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, LOW);
+    ledcWrite(pwmChannelRight, 0);
+  }
+}
+
+// TB6612 short brake: IN1 = IN2 = HIGH
+void brake() {
+  digitalWrite(AIN1, HIGH); digitalWrite(AIN2, HIGH); ledcWrite(pwmChannelLeft, 255);
+  digitalWrite(BIN1, HIGH); digitalWrite(BIN2, HIGH); ledcWrite(pwmChannelRight, 255);
+}
+
+void stopMotors() {
+  setMotorLeft(0);
+  setMotorRight(0);
+}
+
+// --- DRIVE ---
+const int BRAKE_LEAD = 70;  // counts the robot slides after braking -> brake this early
+
+// Drive both wheels the same number of counts (negative = backwards)
+void driveCounts(int32_t counts) {
+  const int dir = counts >= 0 ? 1 : -1;
+  const float target = abs(counts) - BRAKE_LEAD;
+  logf("\nDriving %s %ld counts (%.1f mm)...\n", dir > 0 ? "FORWARD" : "BACKWARD",
+       (long)abs(counts), abs(counts) * MM_PER_COUNT_L);
+  zeroCounts();
+  unsigned long t0 = millis();
+
+  while (true) {
+    int32_t l, r;
+    readCounts(l, r);
+    l *= dir;   // work in "progress" counts, positive in the driving direction
+    r *= dir;
+
+    // Safety: a wheel going the wrong way means a motor is wired the other way
+    if (millis() - t0 > 300 && (l < -50 || r < -50)) {
+      stopMotors();
+      logf("STOPPED: %s wheel runs the wrong way - swap that motor's direction\n",
+                    l < -50 ? "LEFT" : "RIGHT");
+      return;
     }
 
-    noInterrupts();
-    int64_t curL = leftTicks;
-    int64_t curR = rightTicks;
-    interrupts();
+    float travelled = (l + r) / 2.0f;
+    float remaining = target - travelled;
+    if (remaining <= 0) break;
 
-    String json = "{";
-    json += "\"uptime_s\":" + String(millis() / 1000) + ",";
-    json += "\"net_info\":\"" + currentNetInfo + "\",";
-
-    // 5-ToF Distances (mm)
-    json += "\"tof\":{\"l\":" + String(distL) + ",\"lf\":" + String(distLF) + ",\"f\":" + String(distF) + ",\"rf\":" + String(distRF) + ",\"r\":" + String(distR) + "},";
-    json += "\"tof_ok\":{\"l\":" + String(okL ? "true" : "false") + ",\"lf\":" + String(okLF ? "true" : "false") + ",\"f\":" + String(okF ? "true" : "false") + ",\"rf\":" + String(okRF ? "true" : "false") + ",\"r\":" + String(okR ? "true" : "false") + "},";
-
-    // Encoders
-    json += "\"enc\":{\"left\":" + String((long)curL) + ",\"right\":" + String((long)curR) + "},";
-    json += "\"seq\":" + String(currentLogSeq) + ",";
-
-    // Buffered Serial Logs
-    json += "\"logs\":[";
-    bool first = true;
-    for (int i = 0; i < logCount; i++) {
-        int idx = (logHead - logCount + i + LOG_BUFFER_SIZE) % LOG_BUFFER_SIZE;
-        if (logBuffer[idx].seq > since) {
-            if (!first) json += ",";
-            first = false;
-            String escaped = logBuffer[idx].message;
-            escaped.replace("\"", "\\\"");
-            json += "\"" + escaped + "\"";
-        }
+    if (millis() - t0 > 4000) {
+      stopMotors();
+      logf("TIMEOUT: robot did not reach the distance (stuck? MIN_PWM too low?)\n");
+      return;
     }
-    json += "]}";
 
-    server.send(200, "application/json", json);
+    // Slow down near the end
+    float remainingMm = remaining * MM_PER_COUNT_L;
+    int base = MAX_PWM;
+    if (remainingMm < SLOW_MM)
+      base = MIN_PWM + (MAX_PWM - MIN_PWM) * remainingMm / SLOW_MM;
+
+    // Keep straight: if left is ahead, slow left / speed up right
+    int correction = KP_STRAIGHT * (l - r);
+    setMotorLeft(dir * (base - correction));
+    setMotorRight(dir * (base + correction));
+    delay(2);
+  }
+
+  brake();
+  delay(300);
+  stopMotors();
+
+  int32_t l, r;
+  readCounts(l, r);
+  logf("Done in %lu ms: L %ld counts | R %ld counts | target %ld (error L %+ld, R %+ld)\n",
+       millis() - t0, (long)l, (long)r, (long)counts, (long)(l - counts), (long)(r - counts));
+  logf("= L %.1f mm, R %.1f mm. Measure with a ruler and compare.\n\n",
+       l * MM_PER_COUNT_L, r * MM_PER_COUNT_R);
 }
 
-void handleResetEncoders() {
-    noInterrupts();
-    leftTicks  = 0;
-    rightTicks = 0;
-    interrupts();
-    logMessage(">>> [WEB] Encoder counters zeroed <<<");
-    server.send(200, "text/plain", "OK");
+void driveDistance(float mm) {
+  driveCounts(lroundf(mm / MM_PER_COUNT_L));
 }
 
-void handleBlink() {
-    digitalWrite(LED_PIN, HIGH);
-    delay(100);
-    digitalWrite(LED_PIN, LOW);
-    server.send(200, "text/plain", "OK");
+// Run each motor alone briefly with a "forward" command and report which
+// encoder moved and in which direction (forward = positive counts)
+void motorCheck() {
+  for (int m = 0; m < 2; m++) {
+    zeroCounts();
+    if (m == 0) setMotorLeft(70); else setMotorRight(70);
+    delay(250);
+    brake();
+    delay(200);
+    stopMotors();
+    int32_t l, r;
+    readCounts(l, r);
+    logf("%s motor forward cmd -> L enc %+ld, R enc %+ld\n",
+         m == 0 ? "LEFT (A) " : "RIGHT (B)", (long)l, (long)r);
+    delay(300);
+  }
+  logf("Expected: LEFT cmd moves only L (+), RIGHT cmd moves only R (+)\n\n");
 }
 
-// =========================================================================
-// SETUP & MAIN LOOP
-// =========================================================================
-bool lastBtnState = HIGH;
-unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 50;
+bool buttonPressed(int pin) {
+  if (digitalRead(pin) == LOW) {
+    delay(50); // Debounce
+    if (digitalRead(pin) == LOW) {
+      while (digitalRead(pin) == LOW) delay(10);
+      return true;
+    }
+  }
+  return false;
+}
 
 void setup() {
-    // Disable brownout detector for clean Wi-Fi boot
-    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  // Motors + WiFi starting together can dip the supply
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
-    // Keep all ToF sensors off immediately during boot
-    pinMode(XSHUT_L, OUTPUT_OPEN_DRAIN);
-    pinMode(XSHUT_LF, OUTPUT_OPEN_DRAIN);
-    pinMode(XSHUT_F, OUTPUT_OPEN_DRAIN);
-    pinMode(XSHUT_RF, OUTPUT_OPEN_DRAIN);
-    pinMode(XSHUT_R, OUTPUT_OPEN_DRAIN);
-    digitalWrite(XSHUT_L, LOW);
-    digitalWrite(XSHUT_LF, LOW);
-    digitalWrite(XSHUT_F, LOW);
-    digitalWrite(XSHUT_RF, LOW);
-    digitalWrite(XSHUT_R, LOW);
+  Serial.begin(115200);
+  setupMotors();
+  stopMotors();
 
-    Serial.begin(115200);
-    delay(300);
+  pinMode(L_ENC_A, INPUT);
+  pinMode(L_ENC_B, INPUT);
+  pinMode(R_ENC_A, INPUT);
+  pinMode(R_ENC_B, INPUT);
+  leftState = readAB(L_ENC_A, L_ENC_B);
+  rightState = readAB(R_ENC_A, R_ENC_B);
+  attachInterrupt(digitalPinToInterrupt(L_ENC_A), leftEncoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(L_ENC_B), leftEncoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(R_ENC_A), rightEncoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(R_ENC_B), rightEncoderISR, CHANGE);
 
-    pinMode(LED_PIN, OUTPUT);
-    digitalWrite(LED_PIN, HIGH);
+  pinMode(BTN1, INPUT_PULLUP);
+  pinMode(BTN2, INPUT_PULLUP);
 
-    pinMode(L_ENC_A, INPUT);
-    pinMode(L_ENC_B, INPUT);
-    pinMode(R_ENC_A, INPUT);
-    pinMode(R_ENC_B, INPUT);
-
-    pinMode(BTN1, INPUT_PULLUP);
-    pinMode(BTN2, INPUT_PULLUP);
-
-    attachInterrupt(digitalPinToInterrupt(L_ENC_A), isrLeftEncoder, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(R_ENC_A), isrRightEncoder, CHANGE);
-
-    logMessage("==============================================");
-    logMessage("  ESP32 MICROMOUSE WIRELESS TELEMETRY SYSTEM  ");
-    logMessage("==============================================");
-
-    // Station mode ONLY (Connect to Alienware Hotspot)
-    WiFi.mode(WIFI_STA);
-    WiFi.setTxPower(WIFI_POWER_11dBm);
-
-    logMessage("[WiFi] Connecting to hotspot: " + String(WIFI_SSID) + "...");
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-    // Wait for connection
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(300);
-        Serial.print(".");
-    }
-    Serial.println();
-
-    String ip = WiFi.localIP().toString();
-    currentNetInfo = "Hotspot: " + String(WIFI_SSID) + " • IP: " + ip;
-    logMessage("[WiFi] >>> CONNECTED TO " + String(WIFI_SSID) + "! <<<");
-    logMessage("[WiFi] Web Dashboard IP: http://" + ip);
-
-    if (MDNS.begin("micromouse")) {
-        logMessage("[mDNS] Local Domain: http://micromouse.local");
-    }
-
-    // Initialize 5x ToF sensors
-    initToFSensors();
-
-    // Start Web Server
-    server.on("/", HTTP_GET, handleRoot);
-    server.on("/api/telemetry", HTTP_GET, handleTelemetry);
-    server.on("/api/reset_encoders", HTTP_POST, handleResetEncoders);
-    server.on("/api/blink", HTTP_POST, handleBlink);
-    server.begin();
-
-    logMessage("[HTTP] Telemetry server listening on port 80");
-    digitalWrite(LED_PIN, LOW);
+  setupWiFi();
+  Serial.println("Drive test ready: BTN1 = forward 2000 counts, BTN2 = backward 2000 counts");
 }
 
 void loop() {
-    server.handleClient();
+  if (buttonPressed(BTN1)) { delay(1000); driveCounts(2000); }
+  if (buttonPressed(BTN2)) { delay(1000); driveCounts(-2000); }
 
-    // Reset button (BTN1) handling
-    int btnVal = digitalRead(BTN1);
-    if (btnVal != lastBtnState) {
-        lastDebounceTime = millis();
-    }
-    if ((millis() - lastDebounceTime) > debounceDelay) {
-        if (btnVal == LOW && lastBtnState == HIGH) {
-            noInterrupts();
-            leftTicks  = 0;
-            rightTicks = 0;
-            interrupts();
-            logMessage(">>> [BTN1] Hardware Reset: Encoders zeroed <<<");
-            digitalWrite(LED_PIN, HIGH);
-            delay(80);
-            digitalWrite(LED_PIN, LOW);
-        }
-    }
-    lastBtnState = btnVal;
-
-    // Periodic sensor read and telemetry broadcast (~10Hz)
-    static unsigned long lastUpdate = 0;
-    if (millis() - lastUpdate >= 100) {
-        lastUpdate = millis();
-
-        if (okL)  distL  = sensorL.readRangeContinuousMillimeters();
-        if (okLF) distLF = sensorLF.readRangeContinuousMillimeters();
-        if (okF)  distF  = sensorF.readRangeContinuousMillimeters();
-        if (okRF) distRF = sensorRF.readRangeContinuousMillimeters();
-        if (okR)  distR  = sensorR.readRangeContinuousMillimeters();
-
-        noInterrupts();
-        int64_t curL = leftTicks;
-        int64_t curR = rightTicks;
-        interrupts();
-
-        char buf[128];
-        snprintf(buf, sizeof(buf), "L:%4d LF:%4d F:%4d RF:%4d R:%4d | Enc L:%5ld R:%5ld",
-                 distL, distLF, distF, distRF, distR, (long)curL, (long)curR);
-        logMessage(String(buf));
-    }
-
-    // Automatic Wi-Fi reconnection if hotspot signal drops
-    static unsigned long lastWifiCheck = 0;
-    if (millis() - lastWifiCheck >= 3000) {
-        lastWifiCheck = millis();
-        if (WiFi.status() != WL_CONNECTED) {
-            WiFi.reconnect();
-        }
-    }
+  String cmd;
+  if (readCommand(cmd)) {
+    if (cmd == "1") driveCounts(2000);
+    else if (cmd == "2") driveCounts(-2000);
+    else if (cmd.startsWith("c") && cmd.substring(1).toInt() != 0) driveCounts(cmd.substring(1).toInt());
+    else if (cmd == "t") motorCheck();
+    else if (cmd.startsWith("d") && cmd.substring(1).toFloat() > 0) driveDistance(cmd.substring(1).toFloat());
+    else logf("Unknown command. Use 1, 2 or d<mm> (e.g. d120)\n");
+  }
 }

@@ -16,3 +16,6 @@
 *.hex
 .DS_Store
 Thumbs.db
+
+# Local WiFi credentials
+include/wifi_secrets.h
