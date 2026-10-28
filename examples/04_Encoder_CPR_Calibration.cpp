@@ -1,6 +1,6 @@
 // =========================================================================
 // ENCODER CALIBRATION - Counts Per Wheel Revolution (CPR)
-// Motors: 12V 600 RPM N20 gear motors with magnetic quadrature encoders
+// Motors: 12V 300 RPM N20 gear motors with magnetic quadrature encoders
 //
 // Uses full 4x quadrature decoding (interrupts on BOTH A and B, every edge).
 // MEASURED: ~2772 counts per wheel revolution (4x) on both wheels
@@ -304,7 +304,7 @@ void speedTest() {
   stopMotors();
   float rpmL = (l1 - l0) / cprLeft / 2.0f * 60.0f;
   float rpmR = (r1 - r0) / cprRight / 2.0f * 60.0f;
-  Serial.printf("LEFT  %.0f RPM | RIGHT %.0f RPM (rated 600 @ 12V no-load)\n\n", rpmL, rpmR);
+  Serial.printf("LEFT  %.0f RPM | RIGHT %.0f RPM (rated 300 @ 12V no-load)\n\n", rpmL, rpmR);
 }
 
 bool buttonPressed(int pin) {

@@ -1,19 +1,24 @@
 // =========================================================================
-// TURN TEST (90 deg on the spot)
-//   BTN1 (GPIO 13) -> turn RIGHT 90 deg
-//   BTN2 (GPIO 4)  -> turn LEFT 90 deg
-// Waits 1 s after the press so your hand is clear, then turns, keeping
-// both wheels equal, slows down near the end and brakes.
+// MAZE TEST - cell-by-cell moves, wall reading, left-hand wall follower
 //
-// WIRELESS: joins the "alienware" hotspot. Output goes to USB serial AND to
-// a WiFi terminal on port 23 (no cable needed):
-//   pio device monitor --port socket://micromouse.local:23
-// Commands over WiFi or USB (type + Enter):
-//   r = right 90   l = left 90   a<deg> = any angle (a-180 = left 180)   1/2 = fwd/back 2000 counts
+// Placement: robot in the start cell facing the opening, BACK TOUCHING the
+// back wall, centred left/right by eye. (Axle is then 58 mm behind the
+// cell centre - the first move adds that.)
+//
+//   BTN1 (GPIO 13) -> calibrate side sensors, then AUTO run (left-hand rule)
+//                     until back in the start cell (max 30 moves)
+//   BTN2 (GPIO 4)  -> stop (also 'x' over WiFi)
+//
+// WiFi terminal (port 23) / USB commands:
+//   g = auto run     c = calibrate only (robot at start position)
+//   f = 1 cell fwd   r / l = turn right / left 90   b = turn 180
+//   w = read walls   s = live sensor values once    p = reset position to start
 // =========================================================================
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
+#include <Wire.h>
+#include <VL53L0X.h>
 #include "soc/gpio_struct.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
@@ -60,30 +65,6 @@ void setupWiFi() {
   }
 }
 
-// Accept a new WiFi terminal and read commands from USB or WiFi
-String inputLine;
-
-bool readCommand(String &cmd) {
-  if (telnetServer.hasClient()) {
-    if (telnet && telnet.connected()) telnet.stop();
-    telnet = telnetServer.available();
-    logf("WiFi terminal connected. Commands: 1 = fwd 2000, 2 = back 2000, c<counts>, d<mm>, t\n");
-  }
-  while (Serial.available() || (telnet && telnet.available())) {
-    char c = Serial.available() ? Serial.read() : telnet.read();
-    if (c == 13 || c == 10) {  // Enter (CR / LF)
-      if (inputLine.length() == 0) continue;
-      cmd = inputLine;
-      cmd.trim();
-      cmd.toLowerCase();
-      inputLine = "";
-      return true;
-    }
-    if (isPrintable(c) && inputLine.length() < 20) inputLine += c;
-  }
-  return false;
-}
-
 // --- PIN DEFINITIONS ---
 // Motor Driver (TB6612)
 #define PWMA 27
@@ -97,18 +78,43 @@ bool readCommand(String &cmd) {
 #define BTN1 13
 #define BTN2 4
 
+// ToF (order: L, LF, F, RF, R)
+#define I2C_SDA 21
+#define I2C_SCL 22
+enum { S_L, S_LF, S_F, S_RF, S_R };
+const uint8_t XSHUT_PIN[5] = {23, 19, 18, 17, 16};
+const uint8_t ADDR[5]      = {0x30, 0x31, 0x32, 0x33, 0x34};
+const char*   NAME[5]      = {"L", "LF", "F", "RF", "R"};
+
 const int pwmFreq = 5000;
 const int pwmChannelLeft = 0;
 const int pwmChannelRight = 1;
 const int pwmResolution = 8; // 0-255
 
-// --- DRIVE TUNING ---
-const int   MAX_PWM   = 90;    // cruise speed
-const int   MIN_PWM   = 45;    // slowest speed that still moves the robot
-const float SLOW_MM   = 25.0f; // start slowing down this far before the target
-const float KP_STRAIGHT = 0.6f; // PWM per count of left/right difference
+// --- MAZE GEOMETRY (16 mm walls on a 180 mm grid -> 164 mm corridors) ---
+const float START_OFFSET_MM = 58.0f;  // axle behind cell centre with back on the back wall (CAD)
 
-// --- ENCODERS (4x quadrature, same as calibration sketch) ---
+// --- MOTION TUNING (from drive / turn / characterization tests) ---
+const int   MAX_PWM      = 90;
+const int   MIN_PWM      = 45;
+const float SLOW_MM      = 25.0f;
+const float KP_STRAIGHT  = 0.6f;   // PWM per count of L/R encoder difference
+const int   BRAKE_LEAD   = 70;     // counts slid after braking at MAX_PWM
+const int   TURN_PWM     = 80;
+const int   TURN_BRAKE_LEAD = 40;
+
+// --- WALL THRESHOLDS (raw ToF mm; side ones are set by calibration) ---
+const float KP_WALL      = 0.8f;   // PWM per mm of centring error
+const int   SIDE_WALL_MARGIN = 60; // wall if raw < calibrated centre value + this
+const int   FRONT_WALL_RAW   = 120; // F raw below this at a cell centre = wall ahead
+const int   DIAG_WALL_RAW    = 95;  // LF/RF raw below this at a cell centre = wall ahead
+const int   FRONT_ABORT_RAW  = 60;  // unexpected wall this close while moving -> stop
+int sideRefL = 85;   // raw L / R with the robot centred (overwritten by calibration)
+int sideRefR = 85;
+
+// =========================================================================
+// ENCODERS (4x quadrature)
+// =========================================================================
 volatile int32_t leftCount = 0;
 volatile int32_t rightCount = 0;
 volatile uint8_t leftState = 0;
@@ -152,7 +158,9 @@ void zeroCounts() {
   interrupts();
 }
 
-// --- MOTORS ---
+// =========================================================================
+// MOTORS (directions verified on the robot)
+// =========================================================================
 void setupMotors() {
   pinMode(AIN1, OUTPUT);
   pinMode(AIN2, OUTPUT);
@@ -211,147 +219,278 @@ void stopMotors() {
   setMotorRight(0);
 }
 
-// --- DRIVE ---
-const int BRAKE_LEAD = 70;  // counts the robot slides after braking -> brake this early
-
-// Drive both wheels the same number of counts (negative = backwards)
-void driveCounts(int32_t counts) {
-  const int dir = counts >= 0 ? 1 : -1;
-  const float target = abs(counts) - BRAKE_LEAD;
-  logf("\nDriving %s %ld counts (%.1f mm)...\n", dir > 0 ? "FORWARD" : "BACKWARD",
-       (long)abs(counts), abs(counts) * MM_PER_COUNT_L);
-  zeroCounts();
-  unsigned long t0 = millis();
-
-  while (true) {
-    int32_t l, r;
-    readCounts(l, r);
-    l *= dir;   // work in "progress" counts, positive in the driving direction
-    r *= dir;
-
-    // Safety: a wheel going the wrong way means a motor is wired the other way
-    if (millis() - t0 > 300 && (l < -50 || r < -50)) {
-      stopMotors();
-      logf("STOPPED: %s wheel runs the wrong way - swap that motor's direction\n",
-                    l < -50 ? "LEFT" : "RIGHT");
-      return;
-    }
-
-    float travelled = (l + r) / 2.0f;
-    float remaining = target - travelled;
-    if (remaining <= 0) break;
-
-    if (millis() - t0 > 4000) {
-      stopMotors();
-      logf("TIMEOUT: robot did not reach the distance (stuck? MIN_PWM too low?)\n");
-      return;
-    }
-
-    // Slow down near the end
-    float remainingMm = remaining * MM_PER_COUNT_L;
-    int base = MAX_PWM;
-    if (remainingMm < SLOW_MM)
-      base = MIN_PWM + (MAX_PWM - MIN_PWM) * remainingMm / SLOW_MM;
-
-    // Keep straight: if left is ahead, slow left / speed up right
-    int correction = KP_STRAIGHT * (l - r);
-    setMotorLeft(dir * (base - correction));
-    setMotorRight(dir * (base + correction));
-    delay(2);
-  }
-
+void brakeStop() {
   brake();
   delay(300);
   stopMotors();
-
-  int32_t l, r;
-  readCounts(l, r);
-  logf("Done in %lu ms: L %ld counts | R %ld counts | target %ld (error L %+ld, R %+ld)\n",
-       millis() - t0, (long)l, (long)r, (long)counts, (long)(l - counts), (long)(r - counts));
-  logf("= L %.1f mm, R %.1f mm. Measure with a ruler and compare.\n\n",
-       l * MM_PER_COUNT_L, r * MM_PER_COUNT_R);
 }
 
-void driveDistance(float mm) {
-  driveCounts(lroundf(mm / MM_PER_COUNT_L));
+// =========================================================================
+// TOF SENSORS (continuous mode, read without blocking)
+// =========================================================================
+VL53L0X tof[5];
+bool tofOk[5] = {false};
+int tofRaw[5] = {0};   // latest raw mm (8190 = no target)
+
+void initToF() {
+  Wire.begin(I2C_SDA, I2C_SCL);
+  Wire.setClock(400000);
+  for (int i = 0; i < 5; i++) {
+    pinMode(XSHUT_PIN[i], OUTPUT_OPEN_DRAIN);
+    digitalWrite(XSHUT_PIN[i], LOW);
+  }
+  delay(50);
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(XSHUT_PIN[i], HIGH);
+    delay(25);
+    tof[i].setTimeout(100);
+    tofOk[i] = tof[i].init();
+    if (tofOk[i]) {
+      tof[i].setAddress(ADDR[i]);
+      tof[i].setMeasurementTimingBudget(33000);
+      tof[i].startContinuous();
+    }
+    Serial.printf("ToF %-2s %s\n", NAME[i], tofOk[i] ? "OK" : "FAIL");
+    delay(20);
+  }
 }
 
-// --- TURN IN PLACE ---
-const int TURN_PWM = 80;
-const int TURN_BRAKE_LEAD = 40;  // counts each wheel slides after braking
+// Picks up any new readings; returns immediately
+void pollToF() {
+  for (int i = 0; i < 5; i++) {
+    if (!tofOk[i]) continue;
+    if ((tof[i].readReg(VL53L0X::RESULT_INTERRUPT_STATUS) & 0x07) == 0) continue;
+    tofRaw[i] = tof[i].readReg16Bit(VL53L0X::RESULT_RANGE_STATUS + 10);
+    tof[i].writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);
+  }
+}
 
-// Positive degrees = turn right (left wheel forward, right wheel backward)
-void turnDegrees(float deg) {
+// Fresh, averaged readings while standing still
+void readToFAveraged(int out[5], int samples = 5) {
+  long sum[5] = {0};
+  for (int s = 0; s < samples; s++) {
+    for (int i = 0; i < 5; i++) {
+      if (!tofOk[i]) continue;
+      sum[i] += tof[i].readRangeContinuousMillimeters();
+    }
+  }
+  for (int i = 0; i < 5; i++) out[i] = tofOk[i] ? sum[i] / samples : 9999;
+}
+
+// =========================================================================
+// STOP REQUEST (BTN2 or 'x' over WiFi / USB)
+// =========================================================================
+bool abortFlag = false;
+
+bool checkAbort() {
+  if (digitalRead(BTN2) == LOW) abortFlag = true;
+  if (Serial.available() && Serial.peek() == 'x') { Serial.read(); abortFlag = true; }
+  if (telnet && telnet.connected() && telnet.available() && telnet.peek() == 'x') {
+    telnet.read();
+    abortFlag = true;
+  }
+  return abortFlag;
+}
+
+// =========================================================================
+// MOVES
+// =========================================================================
+// Drive straight forward by mm. Uses the side walls to stay centred when both
+// are seen, otherwise keeps the wheel counts equal. Returns false if stopped.
+bool forwardMm(float mm) {
+  const float target = mm / MM_PER_COUNT_L - BRAKE_LEAD;
+  const float total = mm / MM_PER_COUNT_L;
+  zeroCounts();
+  int32_t encOffset = 0;      // L-R difference to hold when not using walls
+  bool usingWalls = false;
+  unsigned long t0 = millis();
+
+  while (true) {
+    if (checkAbort()) { brakeStop(); logf("STOP requested\n"); return false; }
+    pollToF();
+    int32_t l, r;
+    readCounts(l, r);
+    float travelled = (l + r) / 2.0f;
+    float remaining = target - travelled;
+    if (remaining <= 0) break;
+    if (millis() - t0 > 5000) { brakeStop(); logf("TIMEOUT in forward move\n"); return false; }
+
+    // Unexpected wall ahead (before the last 35% of the move)
+    if (total - travelled > 0.35f * total && tofRaw[S_F] > 0 && tofRaw[S_F] < FRONT_ABORT_RAW) {
+      brakeStop();
+      logf("STOP: unexpected wall ahead (F raw %d)\n", tofRaw[S_F]);
+      return false;
+    }
+
+    float remainingMm = remaining * MM_PER_COUNT_L;
+    int base = MAX_PWM;
+    if (remainingMm < SLOW_MM) base = MIN_PWM + (MAX_PWM - MIN_PWM) * remainingMm / SLOW_MM;
+
+    // Centring: positive error = robot is right of centre -> steer left
+    bool leftWall  = tofRaw[S_L] < sideRefL + SIDE_WALL_MARGIN;
+    bool rightWall = tofRaw[S_R] < sideRefR + SIDE_WALL_MARGIN;
+    float correction;
+    if (leftWall && rightWall) {
+      float err = (tofRaw[S_L] - sideRefL) - (tofRaw[S_R] - sideRefR);
+      correction = KP_WALL * err / 2.0f;
+      usingWalls = true;
+    } else {
+      if (usingWalls) { encOffset = l - r; usingWalls = false; }
+      correction = KP_STRAIGHT * ((l - r) - encOffset);
+    }
+    correction = constrain(correction, -25.0f, 25.0f);
+    setMotorLeft(base - correction);
+    setMotorRight(base + correction);
+    delay(2);
+  }
+  brakeStop();
+  return true;
+}
+
+// Turn in place. Positive = right. Returns false if stopped.
+bool turnDegrees(float deg) {
   const int dir = deg >= 0 ? 1 : -1;
   const int32_t counts = lroundf(fabsf(deg) / 90.0f * COUNTS_PER_90_TURN);
   const float target = counts - TURN_BRAKE_LEAD;
-  logf("\nTurning %s %.0f deg (%ld counts per wheel)...\n", dir > 0 ? "RIGHT" : "LEFT",
-       fabsf(deg), (long)counts);
   zeroCounts();
   unsigned long t0 = millis();
 
   while (true) {
+    if (checkAbort()) { brakeStop(); logf("STOP requested\n"); return false; }
     int32_t l, r;
     readCounts(l, r);
-    int32_t pl = dir * l;    // progress of each wheel, positive while turning
+    int32_t pl = dir * l;
     int32_t pr = -dir * r;
-
-    if (millis() - t0 > 300 && (pl < -50 || pr < -50)) {
-      stopMotors();
-      logf("STOPPED: %s wheel runs the wrong way\n", pl < -50 ? "LEFT" : "RIGHT");
-      return;
-    }
-
-    float travelled = (pl + pr) / 2.0f;
-    float remaining = target - travelled;
+    float remaining = target - (pl + pr) / 2.0f;
     if (remaining <= 0) break;
+    if (millis() - t0 > 4000) { brakeStop(); logf("TIMEOUT in turn\n"); return false; }
 
-    if (millis() - t0 > 4000) {
-      stopMotors();
-      logf("TIMEOUT: turn did not finish\n");
-      return;
-    }
-
-    // Slow down for the last 20%
     int base = TURN_PWM;
-    if (remaining < counts * 0.2f)
-      base = MIN_PWM + (TURN_PWM - MIN_PWM) * remaining / (counts * 0.2f);
-
-    // Keep both wheels turning the same amount
+    if (remaining < counts * 0.2f) base = MIN_PWM + (TURN_PWM - MIN_PWM) * remaining / (counts * 0.2f);
     int correction = KP_STRAIGHT * (pl - pr);
     setMotorLeft(dir * (base - correction));
     setMotorRight(-dir * (base + correction));
     delay(2);
   }
-
-  brake();
-  delay(300);
-  stopMotors();
-
-  int32_t l, r;
-  readCounts(l, r);
-  float turned = (dir * l - dir * r) / 2.0f / COUNTS_PER_90_TURN * 90.0f;
-  logf("Done: L %+ld | R %+ld counts (target %ld each) = %.1f deg\n\n",
-       (long)l, (long)r, (long)counts, dir * turned);
+  brakeStop();
+  return true;
 }
 
-// Run each motor alone briefly with a "forward" command and report which
-// encoder moved and in which direction (forward = positive counts)
-void motorCheck() {
-  for (int m = 0; m < 2; m++) {
-    zeroCounts();
-    if (m == 0) setMotorLeft(70); else setMotorRight(70);
-    delay(250);
-    brake();
-    delay(200);
-    stopMotors();
-    int32_t l, r;
-    readCounts(l, r);
-    logf("%s motor forward cmd -> L enc %+ld, R enc %+ld\n",
-         m == 0 ? "LEFT (A) " : "RIGHT (B)", (long)l, (long)r);
-    delay(300);
+// =========================================================================
+// POSITION + WALLS
+// =========================================================================
+int posX = 0, posY = 0;   // cell, start = (0,0)
+int heading = 0;          // 0 = N, 1 = E, 2 = S, 3 = W (start facing N)
+bool atStartOffset = true; // robot still at the start placement (back on wall)
+const char HEAD[4] = {'N', 'E', 'S', 'W'};
+
+struct Walls { bool left, front, right; int raw[5]; };
+
+Walls readWalls() {
+  Walls w;
+  readToFAveraged(w.raw);
+  w.left  = w.raw[S_L] < sideRefL + SIDE_WALL_MARGIN;
+  w.right = w.raw[S_R] < sideRefR + SIDE_WALL_MARGIN;
+  w.front = w.raw[S_F] < FRONT_WALL_RAW ||
+            (w.raw[S_LF] < DIAG_WALL_RAW && w.raw[S_RF] < DIAG_WALL_RAW);
+  return w;
+}
+
+void printWalls(const Walls &w) {
+  logf("Cell (%d,%d) facing %c | walls L:%d F:%d R:%d | raw L %d LF %d F %d RF %d R %d\n",
+       posX, posY, HEAD[heading], w.left, w.front, w.right,
+       w.raw[S_L], w.raw[S_LF], w.raw[S_F], w.raw[S_RF], w.raw[S_R]);
+}
+
+bool moveOneCell() {
+  float mm = CELL_SIZE_MM + (atStartOffset ? START_OFFSET_MM : 0);
+  if (!forwardMm(mm)) return false;
+  atStartOffset = false;
+  static const int DX[4] = {0, 1, 0, -1};
+  static const int DY[4] = {1, 0, -1, 0};
+  posX += DX[heading];
+  posY += DY[heading];
+  return true;
+}
+
+bool turnRight()  { if (!turnDegrees(90))   return false; heading = (heading + 1) % 4; return true; }
+bool turnLeft()   { if (!turnDegrees(-90))  return false; heading = (heading + 3) % 4; return true; }
+bool turnAround() { if (!turnDegrees(180))  return false; heading = (heading + 2) % 4; return true; }
+
+void resetPosition() {
+  posX = 0; posY = 0; heading = 0; atStartOffset = true;
+  logf("Position reset: (0,0) facing N, at start placement\n");
+}
+
+// Side sensors with the robot at the start placement (walls left and right)
+void calibrate() {
+  int raw[5];
+  readToFAveraged(raw, 10);
+  logf("Calibration raw: L %d LF %d F %d RF %d R %d\n", raw[S_L], raw[S_LF], raw[S_F], raw[S_RF], raw[S_R]);
+  if (raw[S_L] > 200 || raw[S_R] > 200) {
+    logf("CALIBRATION FAILED: no side wall seen (L %d, R %d) - keeping old values\n", raw[S_L], raw[S_R]);
+    return;
   }
-  logf("Expected: LEFT cmd moves only L (+), RIGHT cmd moves only R (+)\n\n");
+  sideRefL = raw[S_L];
+  sideRefR = raw[S_R];
+  logf("Side refs: L %d, R %d (wall if raw < ref + %d)\n", sideRefL, sideRefR, SIDE_WALL_MARGIN);
+}
+
+// =========================================================================
+// AUTO RUN: left-hand wall follower until back in the start cell
+// =========================================================================
+void autoRun() {
+  abortFlag = false;
+  resetPosition();
+  calibrate();
+  logf("\n=== AUTO RUN (left-hand rule) ===\n");
+  unsigned long t0 = millis();
+
+  for (int moves = 0; moves < 30; moves++) {
+    Walls w = readWalls();
+    printWalls(w);
+
+    bool ok;
+    if (!w.left)       { logf("-> turn LEFT + forward\n");  ok = (atStartOffset || turnLeft()) && moveOneCell(); }
+    else if (!w.front) { logf("-> forward\n");              ok = moveOneCell(); }
+    else if (!w.right) { logf("-> turn RIGHT + forward\n"); ok = (atStartOffset || turnRight()) && moveOneCell(); }
+    else               { logf("-> dead end, turn 180 + forward\n"); ok = (atStartOffset || turnAround()) && moveOneCell(); }
+    if (!ok) { logf("=== RUN STOPPED ===\n\n"); return; }
+
+    if (posX == 0 && posY == 0) {
+      logf("Back in the start cell after %d moves, %.1f s\n", moves + 1, (millis() - t0) / 1000.0f);
+      printWalls(readWalls());
+      logf("=== RUN DONE ===\n\n");
+      return;
+    }
+  }
+  logf("=== 30 moves reached, stopping ===\n\n");
+}
+
+// =========================================================================
+// COMMANDS
+// =========================================================================
+String inputLine;
+
+bool readCommand(String &cmd) {
+  if (telnetServer.hasClient()) {
+    if (telnet && telnet.connected()) telnet.stop();
+    telnet = telnetServer.available();
+    logf("WiFi terminal connected. g=auto c=calib f=fwd r/l=turn b=180 w=walls s=sensors p=reset x=stop\n");
+  }
+  while (Serial.available() || (telnet && telnet.available())) {
+    char c = Serial.available() ? Serial.read() : telnet.read();
+    if (c == 13 || c == 10) {  // Enter (CR / LF)
+      if (inputLine.length() == 0) continue;
+      cmd = inputLine;
+      cmd.trim();
+      cmd.toLowerCase();
+      inputLine = "";
+      return true;
+    }
+    if (isPrintable(c) && inputLine.length() < 20) inputLine += c;
+  }
+  return false;
 }
 
 bool buttonPressed(int pin) {
@@ -366,8 +505,12 @@ bool buttonPressed(int pin) {
 }
 
 void setup() {
-  // Motors + WiFi starting together can dip the supply
+  // Motors + WiFi + 5 sensors starting together can dip the supply
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  for (int i = 0; i < 5; i++) {
+    pinMode(XSHUT_PIN[i], OUTPUT_OPEN_DRAIN);
+    digitalWrite(XSHUT_PIN[i], LOW);
+  }
 
   Serial.begin(115200);
   setupMotors();
@@ -387,24 +530,32 @@ void setup() {
   pinMode(BTN1, INPUT_PULLUP);
   pinMode(BTN2, INPUT_PULLUP);
 
+  delay(300);
+  initToF();
   setupWiFi();
-  Serial.println("Turn test ready: BTN1 = right 90, BTN2 = left 90");
+  Serial.println("Maze test ready: BTN1 = auto run, BTN2 = stop");
 }
 
 void loop() {
-  if (buttonPressed(BTN1)) { delay(1000); turnDegrees(90); }
-  if (buttonPressed(BTN2)) { delay(1000); turnDegrees(-90); }
+  if (buttonPressed(BTN1)) { delay(1000); autoRun(); }
 
   String cmd;
   if (readCommand(cmd)) {
-    if (cmd == "r") turnDegrees(90);
-    else if (cmd == "l") turnDegrees(-90);
-    else if (cmd.startsWith("a") && cmd.substring(1).toFloat() != 0) turnDegrees(cmd.substring(1).toFloat());
-    else if (cmd == "1") driveCounts(2000);
-    else if (cmd == "2") driveCounts(-2000);
-    else if (cmd.startsWith("c") && cmd.substring(1).toInt() != 0) driveCounts(cmd.substring(1).toInt());
-    else if (cmd == "t") motorCheck();
-    else if (cmd.startsWith("d") && cmd.substring(1).toFloat() > 0) driveDistance(cmd.substring(1).toFloat());
-    else logf("Unknown command. Use r, l, a<deg>, 1, 2, c<counts>, d<mm>, t\n");
+    abortFlag = false;
+    if (cmd == "g") autoRun();
+    else if (cmd == "c") calibrate();
+    else if (cmd == "f") { if (moveOneCell()) printWalls(readWalls()); }
+    else if (cmd == "r") { if (turnRight())  printWalls(readWalls()); }
+    else if (cmd == "l") { if (turnLeft())   printWalls(readWalls()); }
+    else if (cmd == "b") { if (turnAround()) printWalls(readWalls()); }
+    else if (cmd == "w") printWalls(readWalls());
+    else if (cmd == "s") {
+      int raw[5];
+      readToFAveraged(raw);
+      logf("raw L %d LF %d F %d RF %d R %d\n", raw[S_L], raw[S_LF], raw[S_F], raw[S_RF], raw[S_R]);
+    }
+    else if (cmd == "p") resetPosition();
+    else if (cmd == "x") logf("Nothing running\n");
+    else logf("Unknown. g=auto c=calib f=fwd r/l=turn b=180 w=walls s=sensors p=reset x=stop\n");
   }
 }
