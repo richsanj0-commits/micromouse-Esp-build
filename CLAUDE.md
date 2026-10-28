@@ -6,7 +6,8 @@ User prefers small practical steps and short explanations.
 ## Workflow
 - `src/main.cpp` = active sketch (swapped per test). Saved tests in `examples/`:
   01 motor, 02 ToF (old), 03 encoder (old), 04 encoder CPR calibration, 05 ToF test,
-  06 drive test, 07 turn test, 08 motor characterization, 09 maze test (current main.cpp).
+  06 drive test, 07 turn test, 08 motor characterization, 09 maze test,
+  10 maze solver with flood fill (= current main.cpp).
 - Shared values: `include/robot_config.h`. Web telemetry build: `apexweb.cpp` (encoder pins there are old).
 - WiFi credentials: `include/wifi_secrets.h` (gitignored; template `wifi_secrets.example.h`).
 - Upload over USB (COM9 on this PC), then unplug and monitor over WiFi:
@@ -46,9 +47,21 @@ User prefers small practical steps and short explanations.
   nose only ~7 mm from a front wall (F unreliable that close -> LF/RF decide front walls).
 - Start placement: back against the back wall -> axle 58 mm behind cell centre (CAD).
 
+## Maze solver (examples/10, 2026-10-28) - works on the robot
+- BTN1 / `g`: explore (depth-first, prefers left/front/right) and record a wall map until an open
+  2x2 block (no inner walls, not the start) is found = goal, then back to start on the shortest known path.
+- BTN2 / `fr`: fast run start -> goal, flood fill over explored cells only, straights joined into one move.
+  BTN2 during a run = stop. `m` prints the map. Map is in RAM only (power off = explore again).
+- Start for both runs: start cell, back against the wall; its facing = "N" on the map.
+- Straight moves: gyro heading hold (`kh` 3) + side-wall nudge (`kw` 0.15 deg/mm, max 5 deg).
+  Turns to absolute headings (targetYaw), so errors don't add up.
+- Side centre ref = average of L and R at the start (robot placed off-centre used to hug a wall).
+- Front wall ahead: stop at F raw 55 (creeps up to 60 mm extra) -> fixes distance from wheel slip.
+- ToF readings cleared at the start of each move (stale F 53 from the last run used to block the start).
+- Wheel slip on turns is large (wheels 100-230 deg for 90 deg) - gyro handles it.
+- A hole/gap in the floor makes the wheels spin -> position lost. Keep the floor flat.
+
 ## Status (2026-10-28)
-- Done: encoders, ToF check, motor directions, straight drive distance, motor characterization,
-  gyro turns. Maze test (examples/09) driven step by step over WiFi: all cells' walls read right.
-- Side walls: fixed threshold SIDE_WALL_RAW 185 (walls <= 150 raw, open >= 223 raw).
-- Next: full auto run with BTN1 (left-hand, S..6..S) with gyro turns.
+- Done: all hardware, gyro turns, wall following, explore + 2x2 goal + flood-fill fast run.
+- Next ideas: faster fast run (higher speed on straights), save map to flash, smooth turns.
 - Robot IP on the hotspot changes (seen .209, .238): scan 192.168.137.x port 23 if not found.

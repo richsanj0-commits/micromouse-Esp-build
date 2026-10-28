@@ -1,19 +1,19 @@
 // =========================================================================
-// MAZE TEST - cell-by-cell moves, wall reading, left-hand wall follower
+// MAZE SOLVER - explore to the 2x2 goal, then fast run with flood fill
 //
-// Placement: robot in the start cell facing the opening, BACK TOUCHING the
-// back wall, centred left/right by eye. (Axle is then 58 mm behind the
-// cell centre - the first move adds that.)
+// Placement (both runs): robot in the start cell facing N (into the maze),
+// BACK TOUCHING the back wall. (Axle is then 58 mm behind the cell centre -
+// the first move adds that.)
 //
-//   BTN1 (GPIO 13) -> calibrate side sensors, then AUTO run (left-hand rule)
-//                     until back in the start cell (max 30 moves)
-//   BTN2 (GPIO 4)  -> stop (also 'x' over WiFi)
+//   BTN1 (GPIO 13) -> explore until the open 2x2 goal is found, back to start
+//   BTN2 (GPIO 4)  -> fast run start -> goal on the shortest explored path
+//                     (during a run BTN2 = stop, also 'x' over WiFi)
 //
 // WiFi terminal (port 23) / USB commands:
-//   g = auto run     c = calibrate only (robot at start position)
+//   g = explore   fr = fast run   m = print map   c = calibrate only (robot at start)
 //   f = 1 cell fwd   r / l = turn right / left 90   b = turn 180
 //   w = read walls   s = live sensor values once    p = reset position to start
-//   tt1.03 = turns 3% bigger   kw0.8 = wall centring gain (kw0 = off)   ? = show settings
+//   kh3 = heading hold (PWM per deg)   kw0.15 = wall nudge (deg per mm, kw0 = off)   ? = settings
 //   gyro / enc = turn on the gyro (default) / on encoders only   y = gyro check   gd = gyro diagnostic
 // =========================================================================
 #include <Arduino.h>
@@ -106,14 +106,15 @@ const int   TURN_PWM     = 80;
 const int   TURN_BRAKE_LEAD = 40;
 
 // --- WALL THRESHOLDS (raw ToF mm; side ones are set by calibration) ---
-float kpWall    = 0.8f;   // PWM per mm of centring error (WiFi: kw<value>, kw0 = off)
+float kpWall    = 0.15f;  // degrees of steering per mm off-centre (WiFi: kw<value>, kw0 = off)
 float turnTrim  = 1.0f;   // extra turn scale on top of TURN_SCALE (WiFi: tt<value>)
 const int   SIDE_WALL_RAW = 185;   // L/R raw below this = wall (maze test: walls <= 150, open >= 223)
 const int   FRONT_WALL_RAW   = 120; // F raw below this at a cell centre = wall ahead
 const int   DIAG_WALL_RAW    = 95;  // LF/RF raw below this at a cell centre = wall ahead
 const int   FRONT_ABORT_RAW  = 60;  // unexpected wall this close while moving -> stop
-int sideRefL = 85;   // raw L / R with the robot centred (overwritten by calibration)
-int sideRefR = 85;
+const int   FRONT_STOP_RAW   = 55;  // F raw with the robot at a cell centre facing a wall
+int sideRefL = 91;   // raw L / R with the robot centred (measured; overwritten by calibration)
+int sideRefR = 91;
 
 // =========================================================================
 // ENCODERS (4x quadrature)
@@ -298,57 +299,8 @@ bool checkAbort() {
 // =========================================================================
 // MOVES
 // =========================================================================
-// Drive straight forward by mm. Uses the side walls to stay centred when both
-// are seen, otherwise keeps the wheel counts equal. Returns false if stopped.
-bool forwardMm(float mm) {
-  const float target = mm / MM_PER_COUNT_L - BRAKE_LEAD;
-  const float total = mm / MM_PER_COUNT_L;
-  zeroCounts();
-  int32_t encOffset = 0;      // L-R difference to hold when not using walls
-  bool usingWalls = false;
-  unsigned long t0 = millis();
-
-  while (true) {
-    if (checkAbort()) { brakeStop(); logf("STOP requested\n"); return false; }
-    pollToF();
-    int32_t l, r;
-    readCounts(l, r);
-    float travelled = (l + r) / 2.0f;
-    float remaining = target - travelled;
-    if (remaining <= 0) break;
-    if (millis() - t0 > 5000) { brakeStop(); logf("TIMEOUT in forward move\n"); return false; }
-
-    // Unexpected wall ahead (before the last 35% of the move)
-    if (total - travelled > 0.35f * total && tofRaw[S_F] > 0 && tofRaw[S_F] < FRONT_ABORT_RAW) {
-      brakeStop();
-      logf("STOP: unexpected wall ahead (F raw %d)\n", tofRaw[S_F]);
-      return false;
-    }
-
-    float remainingMm = remaining * MM_PER_COUNT_L;
-    int base = MAX_PWM;
-    if (remainingMm < SLOW_MM) base = MIN_PWM + (MAX_PWM - MIN_PWM) * remainingMm / SLOW_MM;
-
-    // Centring: positive error = robot is right of centre -> steer left
-    bool leftWall  = tofRaw[S_L] < SIDE_WALL_RAW;
-    bool rightWall = tofRaw[S_R] < SIDE_WALL_RAW;
-    float correction;
-    if (leftWall && rightWall) {
-      float err = (tofRaw[S_L] - sideRefL) - (tofRaw[S_R] - sideRefR);
-      correction = kpWall * err / 2.0f;
-      usingWalls = true;
-    } else {
-      if (usingWalls) { encOffset = l - r; usingWalls = false; }
-      correction = KP_STRAIGHT * ((l - r) - encOffset);
-    }
-    correction = constrain(correction, -25.0f, 25.0f);
-    setMotorLeft(base - correction);
-    setMotorRight(base + correction);
-    delay(2);
-  }
-  brakeStop();
-  return true;
-}
+// Straight drive (defined after the gyro section, it steers with the gyro)
+bool forwardMm(float mm);
 
 // =========================================================================
 // GYRO (MPU6050 at 0x68) - measures the real turn angle, wheel slip or not
@@ -360,6 +312,12 @@ uint8_t gyroAxis = 2;     // axis pointing up (found from gravity at start)
 float gyroBias = 0;       // raw reading when still
 float gyroBrakeDeg = 4.7f; // degrees it keeps turning after braking (tuned: 4 x 90 within 3 deg) (WiFi: gb<value>)
 bool useGyroTurns = true;  // turn on the gyro (encoder turns slip 79-95 deg) (WiFi: gyro / enc)
+int yawSign = -1;          // set from the mounting at start, checked after every turn
+
+// Straight-drive steering (WiFi: kh<value>, kw<value>)
+float kpHeading = 3.0f;    // PWM per degree of heading error
+// kpWall (above) = degrees of heading change per mm off-centre
+const float MAX_WALL_STEER_DEG = 5.0f;  // wall correction never steers more than this
 
 void mpuWrite(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(MPU_ADDR);
@@ -412,38 +370,69 @@ void initGyro() {
   gyroAxis = 0;
   for (int i = 1; i < 3; i++)
     if (abs(acc[i]) > abs(acc[gyroAxis])) gyroAxis = i;
+  // Axis pointing up + counter-clockwise positive -> a right turn reads negative
+  yawSign = acc[gyroAxis] > 0 ? -1 : 1;
   logf("Gyro OK, turning axis = %c (accel %d %d %d)\n", 'X' + gyroAxis, acc[0], acc[1], acc[2]);
   calibrateGyro();
+}
+
+// --- HEADING (yaw) TRACKING: degrees, right = positive, 0 = start direction ---
+float yaw = 0;           // where the robot points now
+float targetYaw = 0;     // where it should point (multiple of 90)
+unsigned long yawLast = 0;
+
+void updateYaw() {
+  unsigned long now = micros();
+  if (gyroOk && yawLast != 0)
+    yaw += yawSign * (readGyroRaw() - gyroBias) / GYRO_LSB_PER_DPS * (now - yawLast) / 1e6f;
+  yawLast = now;
+}
+
+void resetYaw() {
+  yaw = 0;
+  targetYaw = 0;
+  yawLast = micros();
 }
 
 // Turn in place using the gyro. Positive = right. Returns false if stopped.
 bool turnEncoders(float deg);
 
+// Turns to an ABSOLUTE direction (targetYaw += deg), so small errors from
+// earlier turns are corrected instead of adding up.
 bool turnDegrees(float deg) {
   if (!gyroOk || !useGyroTurns) return turnEncoders(deg);
-  const int dir = deg >= 0 ? 1 : -1;
-  const float target = fabsf(deg) - gyroBrakeDeg;
-  float angle = 0;
+  targetYaw += deg;
+  updateYaw();
+  const float startYaw = yaw;
+  const float needed = targetYaw - startYaw;      // includes any earlier error
+  const int dir = needed >= 0 ? 1 : -1;
+  const float stopAt = fabsf(needed) - gyroBrakeDeg;
   zeroCounts();
   unsigned long t0 = millis();
-  unsigned long last = micros();
 
   while (true) {
     if (checkAbort()) { brakeStop(); logf("STOP requested\n"); return false; }
-    unsigned long now = micros();
-    angle += (readGyroRaw() - gyroBias) / GYRO_LSB_PER_DPS * (now - last) / 1e6f;
-    last = now;
-    float remaining = target - fabsf(angle);
+    updateYaw();
+    float turned = fabsf(yaw - startYaw);          // works even if yawSign is wrong
+    float remaining = stopAt - turned;
     if (remaining <= 0) break;
     if (millis() - t0 > 4000) { brakeStop(); logf("TIMEOUT in turn\n"); return false; }
+
+    // Wheels spinning far more than the robot turns = stuck on a wall
+    int32_t l, r;
+    readCounts(l, r);
+    float encDeg = (dir * l - dir * r) / 2.0f / COUNTS_PER_90_TURN * 90.0f;
+    if (encDeg > 2.0f * fabsf(needed) + 30) {
+      brakeStop();
+      logf("STOP: stuck in turn (wheels %.0f deg, robot %.0f deg)\n", encDeg, turned);
+      return false;
+    }
 
     // Slow down for the last 25 degrees
     int base = TURN_PWM;
     if (remaining < 25) base = MIN_PWM + (TURN_PWM - MIN_PWM) * remaining / 25;
 
     // Keep both wheels turning the same amount
-    int32_t l, r;
-    readCounts(l, r);
     int correction = KP_STRAIGHT * (dir * l + dir * r);
     setMotorLeft(dir * (base - correction));
     setMotorRight(-dir * (base + correction));
@@ -454,17 +443,96 @@ bool turnDegrees(float deg) {
   brake();
   unsigned long tb = millis();
   while (millis() - tb < 300) {
-    unsigned long now = micros();
-    angle += (readGyroRaw() - gyroBias) / GYRO_LSB_PER_DPS * (now - last) / 1e6f;
-    last = now;
+    updateYaw();
     delayMicroseconds(500);
   }
   stopMotors();
 
+  // Check the gyro direction: the measured turn must have the commanded sign
+  float signedTurn = yaw - startYaw;
+  if (fabsf(signedTurn) > 30 && (signedTurn > 0) != (dir > 0)) {
+    yawSign = -yawSign;
+    yaw = startYaw - signedTurn;
+    logf("Gyro direction was reversed - fixed\n");
+  }
   int32_t l, r;
   readCounts(l, r);
   float encDeg = (dir * l - dir * r) / 2.0f / COUNTS_PER_90_TURN * 90.0f;
-  logf("Turn %+.0f: gyro %.1f deg | encoders say %.1f deg\n", deg, fabsf(angle), encDeg);
+  logf("Turn %+.0f: heading now %.1f (target %.0f) | wheels %.1f deg\n", deg, yaw, targetYaw, encDeg);
+  return true;
+}
+
+// Drive straight forward by mm.
+// - Gyro holds the heading (targetYaw), so it drives straight even if wheels slip
+// - Side walls (either one or both) nudge that heading by a few degrees to
+//   bring the robot back to the centre of the corridor
+bool forwardMm(float mm) {
+  const float target = mm / MM_PER_COUNT_L - BRAKE_LEAD;
+  const float total = mm / MM_PER_COUNT_L;
+  zeroCounts();
+  updateYaw();
+  for (int i = 0; i < 5; i++) tofRaw[i] = 0;   // forget readings from the last move (0 = ignored)
+  int32_t encOffset = 0;
+  unsigned long t0 = millis();
+  bool creeping = false;
+
+  while (true) {
+    if (checkAbort()) { brakeStop(); logf("STOP requested\n"); return false; }
+    pollToF();
+    updateYaw();
+    int32_t l, r;
+    readCounts(l, r);
+    float travelled = (l + r) / 2.0f;
+    float remaining = target - travelled;
+    bool nearEnd = total - travelled < 0.35f * total;
+
+    // Front wall ahead near the end: its distance decides where to stop, not the encoders
+    bool frontWall = tofRaw[S_F] > 0 && tofRaw[S_F] < FRONT_WALL_RAW;
+    if (nearEnd && frontWall && tofRaw[S_F] <= FRONT_STOP_RAW) break;
+    if (remaining <= 0) {
+      // Encoders say done but the front wall is still far -> creep up to it (max 60 mm extra)
+      if (frontWall && tofRaw[S_F] > FRONT_STOP_RAW && -remaining * MM_PER_COUNT_L < 60) creeping = true;
+      else break;
+    }
+    // ~5.7 s for one cell, longer for straights
+    if (millis() - t0 > 3000 + mm * 15) { brakeStop(); logf("TIMEOUT in forward move\n"); return false; }
+
+    // Unexpected wall ahead (before the last 35% of the move)
+    if (!nearEnd && tofRaw[S_F] > 0 && tofRaw[S_F] < FRONT_ABORT_RAW) {
+      brakeStop();
+      logf("STOP: unexpected wall ahead (F raw %d)\n", tofRaw[S_F]);
+      return false;
+    }
+
+    float remainingMm = remaining * MM_PER_COUNT_L;
+    int base = MAX_PWM;
+    if (remainingMm < SLOW_MM) base = MIN_PWM + (MAX_PWM - MIN_PWM) * remainingMm / SLOW_MM;
+    if (creeping) base = MIN_PWM;
+
+    // Off-centre error in mm, positive = robot is right of centre
+    bool leftWall  = tofRaw[S_L] > 0 && tofRaw[S_L] < SIDE_WALL_RAW;
+    bool rightWall = tofRaw[S_R] > 0 && tofRaw[S_R] < SIDE_WALL_RAW;
+    float offCentre = 0;
+    if (leftWall && rightWall) offCentre = ((tofRaw[S_L] - sideRefL) - (tofRaw[S_R] - sideRefR)) / 2.0f;
+    else if (leftWall)         offCentre = tofRaw[S_L] - sideRefL;
+    else if (rightWall)        offCentre = -(tofRaw[S_R] - sideRefR);
+
+    float correction;
+    if (gyroOk && useGyroTurns) {
+      // Right of centre -> aim a little left (smaller yaw)
+      float steer = constrain(kpWall * offCentre, -MAX_WALL_STEER_DEG, MAX_WALL_STEER_DEG);
+      float headingErr = yaw - (targetYaw - steer);   // positive = pointing too far right
+      correction = kpHeading * headingErr;              // positive -> turn left
+    } else {
+      correction = KP_STRAIGHT * ((l - r) - encOffset);
+    }
+    correction = constrain(correction, -25.0f, 25.0f);
+    setMotorLeft(base - correction);
+    setMotorRight(base + correction);
+    delay(2);
+  }
+  brakeStop();
+  updateYaw();
   return true;
 }
 
@@ -551,16 +619,19 @@ void printWalls(const Walls &w) {
        w.raw[S_L], w.raw[S_LF], w.raw[S_F], w.raw[S_RF], w.raw[S_R]);
 }
 
-bool moveOneCell() {
-  float mm = CELL_SIZE_MM + (atStartOffset ? START_OFFSET_MM : 0);
+const int DX[4] = {0, 1, 0, -1};   // cell step for N, E, S, W
+const int DY[4] = {1, 0, -1, 0};
+
+// Drive n cells straight in one move
+bool moveCells(int n) {
+  float mm = n * CELL_SIZE_MM + (atStartOffset ? START_OFFSET_MM : 0);
   if (!forwardMm(mm)) return false;
   atStartOffset = false;
-  static const int DX[4] = {0, 1, 0, -1};
-  static const int DY[4] = {1, 0, -1, 0};
-  posX += DX[heading];
-  posY += DY[heading];
+  posX += DX[heading] * n;
+  posY += DY[heading] * n;
   return true;
 }
+bool moveOneCell() { return moveCells(1); }
 
 bool turnRight()  { if (!turnDegrees(90))   return false; heading = (heading + 1) % 4; return true; }
 bool turnLeft()   { if (!turnDegrees(-90))  return false; heading = (heading + 3) % 4; return true; }
@@ -568,12 +639,14 @@ bool turnAround() { if (!turnDegrees(180))  return false; heading = (heading + 2
 
 void resetPosition() {
   posX = 0; posY = 0; heading = 0; atStartOffset = true;
+  resetYaw();
   logf("Position reset: (0,0) facing N, at start placement\n");
 }
 
 // Side sensors with the robot at the start placement (walls left and right)
 void calibrate() {
   calibrateGyro();
+  resetYaw();
   int raw[5];
   readToFAveraged(raw, 10);
   logf("Calibration raw: L %d LF %d F %d RF %d R %d\n", raw[S_L], raw[S_LF], raw[S_F], raw[S_RF], raw[S_R]);
@@ -581,40 +654,215 @@ void calibrate() {
     logf("CALIBRATION FAILED: no side wall seen (L %d, R %d) - keeping old values\n", raw[S_L], raw[S_R]);
     return;
   }
-  sideRefL = raw[S_L];
-  sideRefR = raw[S_R];
+  // Centre = middle of the two walls, so a robot placed off-centre still learns the true centre
+  sideRefL = (raw[S_L] + raw[S_R]) / 2;
+  sideRefR = sideRefL;
   logf("Side refs (centre): L %d, R %d. Wall if raw < %d\n", sideRefL, sideRefR, SIDE_WALL_RAW);
 }
 
 // =========================================================================
-// AUTO RUN: left-hand wall follower until back in the start cell
+// MAZE MAP + RUNS
+// Explore (BTN1 / g): depth-first into unvisited cells (left, front, right
+//   first), recording walls, until an open 2x2 block (the goal) is found.
+//   Then back to the start on the shortest known path.
+// Fast run (BTN2 / fr): flood fill over explored cells only, start -> goal,
+//   straight cells joined into one move.
+// Start for both: start cell, back against the wall, facing N.
 // =========================================================================
-void autoRun() {
+const int GRID = 32, OFF = 16;   // map covers -16..15 cells around the start
+bool visited[GRID][GRID];        // walls of this cell are known
+uint8_t wallMap[GRID][GRID];     // bit d set = wall on side d (0 N, 1 E, 2 S, 3 W)
+uint8_t cameFrom[GRID * GRID];   // direction moved into each new cell (for backing up)
+int16_t dist[GRID][GRID];        // flood fill: cells to the target, -1 = unreachable
+bool goalFound = false;
+int goalX = 0, goalY = 0;        // bottom-left cell of the 2x2 goal
+
+bool inGrid(int x, int y) { return x >= -OFF && y >= -OFF && x < GRID - OFF && y < GRID - OFF; }
+bool isVisited(int x, int y) { return inGrid(x, y) && visited[x + OFF][y + OFF]; }
+
+void setWall(int x, int y, int d) {
+  wallMap[x + OFF][y + OFF] |= 1 << d;
+  int nx = x + DX[d], ny = y + DY[d];
+  if (inGrid(nx, ny)) wallMap[nx + OFF][ny + OFF] |= 1 << ((d + 2) % 4);
+}
+
+// Can we drive from (x,y) to its neighbour on side d? Only between explored cells.
+bool canGo(int x, int y, int d) {
+  return isVisited(x, y) && isVisited(x + DX[d], y + DY[d]) && !(wallMap[x + OFF][y + OFF] & (1 << d));
+}
+
+// Record the walls of the current cell (first visit only)
+void recordWalls(const Walls &w, bool wallBehind) {
+  if (isVisited(posX, posY)) return;
+  visited[posX + OFF][posY + OFF] = true;
+  if (w.left)  setWall(posX, posY, (heading + 3) % 4);
+  if (w.front) setWall(posX, posY, heading);
+  if (w.right) setWall(posX, posY, (heading + 1) % 4);
+  if (wallBehind) setWall(posX, posY, (heading + 2) % 4);
+}
+
+// Open 2x2 block with (x,y) bottom-left: all 4 explored, no walls inside, not the start
+bool isGoalBlock(int x, int y) {
+  if ((x == 0 || x == -1) && (y == 0 || y == -1)) return false;
+  return canGo(x, y, 1) && canGo(x, y, 0) && canGo(x + 1, y, 0) && canGo(x, y + 1, 1);
+}
+
+bool checkGoal() {
+  for (int ox = -1; ox <= 0; ox++)
+    for (int oy = -1; oy <= 0; oy++)
+      if (isGoalBlock(posX + ox, posY + oy)) { goalFound = true; goalX = posX + ox; goalY = posY + oy; return true; }
+  return false;
+}
+
+// Flood fill from the target: dist = cells to go, over explored cells only
+void flood(bool toGoal) {
+  static int8_t qx[GRID * GRID], qy[GRID * GRID];
+  int head = 0, tail = 0;
+  for (int i = 0; i < GRID; i++) for (int j = 0; j < GRID; j++) dist[i][j] = -1;
+  auto seed = [&](int x, int y) { dist[x + OFF][y + OFF] = 0; qx[tail] = x; qy[tail++] = y; };
+  if (toGoal) { seed(goalX, goalY); seed(goalX + 1, goalY); seed(goalX, goalY + 1); seed(goalX + 1, goalY + 1); }
+  else seed(0, 0);
+  while (head < tail) {
+    int x = qx[head], y = qy[head++];
+    for (int d = 0; d < 4; d++) {
+      int nx = x + DX[d], ny = y + DY[d];
+      if (!canGo(x, y, d) || dist[nx + OFF][ny + OFF] >= 0) continue;
+      dist[nx + OFF][ny + OFF] = dist[x + OFF][y + OFF] + 1;
+      qx[tail] = nx; qy[tail++] = ny;
+    }
+  }
+}
+
+// Turn to an absolute direction (0..3) and drive n cells
+bool goDir(int d, int n = 1) {
+  int t = (d - heading + 4) % 4;
+  if (t != 0 && atStartOffset) {           // at the start the axle is behind centre:
+    if (!forwardMm(START_OFFSET_MM)) return false;   // drive to the centre first, then turn
+    atStartOffset = false;
+  }
+  bool ok = true;
+  if (t == 1) ok = turnRight();
+  else if (t == 2) ok = turnAround();
+  else if (t == 3) ok = turnLeft();
+  return ok && moveCells(n);
+}
+
+// Drive down the flood fill to its target, joining straight cells into one move
+bool followFlood() {
+  if (dist[posX + OFF][posY + OFF] < 0) { logf("No known path!\n"); return false; }
+  while (dist[posX + OFF][posY + OFF] > 0) {
+    int cur = dist[posX + OFF][posY + OFF];
+    int best = -1;
+    for (int i = 0; i < 4 && best < 0; i++) {
+      int d = (heading + i) % 4;   // straight on first = fewer turns
+      if (canGo(posX, posY, d) && dist[posX + DX[d] + OFF][posY + DY[d] + OFF] == cur - 1) best = d;
+    }
+    if (best < 0) { logf("Path lost!\n"); return false; }
+    int n = 1, x = posX + DX[best], y = posY + DY[best];
+    while (dist[x + OFF][y + OFF] > 0 && canGo(x, y, best) &&
+           dist[x + DX[best] + OFF][y + DY[best] + OFF] == dist[x + OFF][y + OFF] - 1) {
+      n++; x += DX[best]; y += DY[best];
+    }
+    logf("-> %c x%d\n", HEAD[best], n);
+    if (!goDir(best, n)) return false;
+  }
+  return true;
+}
+
+// Map of explored cells (N up): S = start, G = goal, ? = not explored
+void printMap() {
+  int x0 = 99, x1 = -99, y0 = 99, y1 = -99;
+  for (int x = -OFF; x < GRID - OFF; x++)
+    for (int y = -OFF; y < GRID - OFF; y++)
+      if (isVisited(x, y)) { x0 = min(x0, x); x1 = max(x1, x); y0 = min(y0, y); y1 = max(y1, y); }
+  if (x0 > x1) { logf("Map empty - explore first\n"); return; }
+  char line[200];
+  for (int y = y1; y >= y0; y--) {
+    int p = 0;
+    for (int x = x0; x <= x1; x++) p += sprintf(line + p, "+%s", wallMap[x + OFF][y + OFF] & 1 ? "---" : "   ");
+    logf("%s+\n", line);
+    p = 0;
+    for (int x = x0; x <= x1; x++) {
+      bool g = goalFound && (x == goalX || x == goalX + 1) && (y == goalY || y == goalY + 1);
+      const char *c = (x == 0 && y == 0) ? " S " : g ? " G " : isVisited(x, y) ? "   " : " ? ";
+      p += sprintf(line + p, "%c%s", wallMap[x + OFF][y + OFF] & 8 ? '|' : ' ', c);
+    }
+    logf("%s%c\n", line, wallMap[x1 + OFF][y + OFF] & 2 ? '|' : ' ');
+  }
+  int p = 0;
+  for (int x = x0; x <= x1; x++) p += sprintf(line + p, "+%s", wallMap[x + OFF][y0 + OFF] & 4 ? "---" : "   ");
+  logf("%s+\n", line);
+}
+
+void exploreRun() {
   abortFlag = false;
   resetPosition();
   calibrate();
-  logf("\n=== AUTO RUN (left-hand rule) ===\n");
+  memset(visited, 0, sizeof(visited));
+  memset(wallMap, 0, sizeof(wallMap));
+  goalFound = false;
+  logf("\n=== EXPLORE: looking for the 2x2 goal ===\n");
   unsigned long t0 = millis();
+  int depth = 0, moves = 0;
 
-  for (int moves = 0; moves < 30; moves++) {
+  while (true) {
+    if (moves >= 300) { logf("=== 300 moves reached, stopping ===\n\n"); return; }
     Walls w = readWalls();
     printWalls(w);
+    recordWalls(w, moves == 0);   // start cell: back against a wall
+    if (checkGoal()) {
+      logf("GOAL found: 2x2 from (%d,%d) to (%d,%d) after %d moves, %.1f s\n",
+           goalX, goalY, goalX + 1, goalY + 1, moves, (millis() - t0) / 1000.0f);
+      break;
+    }
+
+    // Open neighbours not yet visited, in order left, front, right
+    int next = -1;
+    const int rel[3] = {3, 0, 1};
+    const bool wall[3] = {w.left, w.front, w.right};
+    for (int i = 0; i < 3 && next < 0; i++) {
+      int d = (heading + rel[i]) % 4;
+      if (!wall[i] && inGrid(posX + DX[d], posY + DY[d]) && !isVisited(posX + DX[d], posY + DY[d])) next = d;
+    }
 
     bool ok;
-    if (!w.left)       { logf("-> turn LEFT + forward\n");  ok = (atStartOffset || turnLeft()) && moveOneCell(); }
-    else if (!w.front) { logf("-> forward\n");              ok = moveOneCell(); }
-    else if (!w.right) { logf("-> turn RIGHT + forward\n"); ok = (atStartOffset || turnRight()) && moveOneCell(); }
-    else               { logf("-> dead end, turn 180 + forward\n"); ok = (atStartOffset || turnAround()) && moveOneCell(); }
-    if (!ok) { logf("=== RUN STOPPED ===\n\n"); return; }
-
-    if (posX == 0 && posY == 0) {
-      logf("Back in the start cell after %d moves, %.1f s\n", moves + 1, (millis() - t0) / 1000.0f);
-      printWalls(readWalls());
+    if (next >= 0) {
+      logf("-> new cell %c\n", HEAD[next]);
+      cameFrom[depth++] = next;
+      ok = goDir(next);
+    } else if (depth > 0) {
+      int back = (cameFrom[--depth] + 2) % 4;
+      logf("-> nothing new, back %c\n", HEAD[back]);
+      ok = goDir(back);
+    } else {
+      logf("Whole maze explored, NO open 2x2 goal found (%d moves)\n", moves);
+      printMap();
       logf("=== RUN DONE ===\n\n");
       return;
     }
+    if (!ok) { logf("=== RUN STOPPED ===\n\n"); return; }
+    moves++;
   }
-  logf("=== 30 moves reached, stopping ===\n\n");
+
+  logf("=== Back to start (shortest known path) ===\n");
+  flood(false);
+  bool ok = followFlood();
+  printMap();
+  if (ok) logf("Back at start, %.1f s total. Place it at the start facing N, press BTN2 for the fast run\n",
+               (millis() - t0) / 1000.0f);
+  logf(ok ? "=== EXPLORE DONE ===\n\n" : "=== RUN STOPPED ===\n\n");
+}
+
+void fastRun() {
+  abortFlag = false;
+  if (!goalFound) { logf("No goal known - explore first (BTN1 / g)\n"); return; }
+  resetPosition();
+  calibrate();
+  flood(true);
+  logf("\n=== FAST RUN: %d cells to the goal ===\n", dist[OFF][OFF]);
+  unsigned long t0 = millis();
+  if (followFlood()) logf("GOAL reached in %.1f s\n=== FAST RUN DONE ===\n\n", (millis() - t0) / 1000.0f);
+  else logf("=== RUN STOPPED ===\n\n");
 }
 
 // =========================================================================
@@ -684,16 +932,20 @@ void setup() {
   initToF();
   initGyro();
   setupWiFi();
-  Serial.println("Maze test ready: BTN1 = auto run, BTN2 = stop");
+  Serial.println("Maze solver ready: BTN1 = explore, BTN2 = fast run (or stop)");
 }
 
 void loop() {
-  if (buttonPressed(BTN1)) { delay(1000); autoRun(); }
+  updateYaw();
+  if (buttonPressed(BTN1)) { delay(1000); exploreRun(); }
+  if (buttonPressed(BTN2)) { delay(1000); fastRun(); }   // while a run is going BTN2 = stop
 
   String cmd;
   if (readCommand(cmd)) {
     abortFlag = false;
-    if (cmd == "g") autoRun();
+    if (cmd == "g") exploreRun();
+    else if (cmd == "fr") fastRun();
+    else if (cmd == "m") printMap();
     else if (cmd == "c") calibrate();
     else if (cmd == "f") { if (moveOneCell()) printWalls(readWalls()); }
     else if (cmd == "r") { if (turnRight())  printWalls(readWalls()); }
@@ -712,7 +964,11 @@ void loop() {
     }
     else if (cmd.startsWith("kw")) {
       kpWall = cmd.substring(2).toFloat();
-      logf("Wall centring gain = %.2f%s\n", kpWall, kpWall == 0 ? " (OFF - encoders only)" : "");
+      logf("Wall nudge = %.2f deg per mm off-centre%s\n", kpWall, kpWall == 0 ? " (OFF - gyro heading only)" : "");
+    }
+    else if (cmd.startsWith("kh")) {
+      kpHeading = cmd.substring(2).toFloat();
+      logf("Heading hold = %.1f PWM per degree\n", kpHeading);
     }
     else if (cmd == "gd") {
       // Gyro diagnostic: chip id, settings, raw readings while still
@@ -752,8 +1008,8 @@ void loop() {
       logf("Gyro %s, axis %c, drift %.2f deg in 2 s (keep robot still)\n",
            gyroOk ? "OK" : "MISSING", 'X' + gyroAxis, angle);
     }
-    else if (cmd == "?") logf("gyro %s | gyro brake %.1f | turn trim %.3f (encoder turns) | wall gain %.2f | side refs L %d R %d\n",
-                              gyroOk ? "ON" : "OFF", gyroBrakeDeg, turnTrim, kpWall, sideRefL, sideRefR);
+    else if (cmd == "?") logf("gyro %s (sign %d) | heading %.1f target %.0f | brake %.1f | heading hold %.1f | wall nudge %.2f | side refs L %d R %d\n",
+                              gyroOk ? "ON" : "OFF", yawSign, yaw, targetYaw, gyroBrakeDeg, kpHeading, kpWall, sideRefL, sideRefR);
     else if (cmd == "x") logf("Nothing running\n");
     else logf("Unknown. g=auto c=calib f=fwd r/l=turn b=180 w=walls s=sensors p=reset x=stop\n");
   }
