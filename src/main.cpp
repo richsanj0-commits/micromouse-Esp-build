@@ -13,6 +13,8 @@
 //   g = auto run     c = calibrate only (robot at start position)
 //   f = 1 cell fwd   r / l = turn right / left 90   b = turn 180
 //   w = read walls   s = live sensor values once    p = reset position to start
+//   tt1.03 = turns 3% bigger   kw0.8 = wall centring gain (kw0 = off)   ? = show settings
+//   gyro / enc = turn on the gyro (default) / on encoders only   y = gyro check   gd = gyro diagnostic
 // =========================================================================
 #include <Arduino.h>
 #include <WiFi.h>
@@ -104,8 +106,9 @@ const int   TURN_PWM     = 80;
 const int   TURN_BRAKE_LEAD = 40;
 
 // --- WALL THRESHOLDS (raw ToF mm; side ones are set by calibration) ---
-const float KP_WALL      = 0.8f;   // PWM per mm of centring error
-const int   SIDE_WALL_MARGIN = 60; // wall if raw < calibrated centre value + this
+float kpWall    = 0.8f;   // PWM per mm of centring error (WiFi: kw<value>, kw0 = off)
+float turnTrim  = 1.0f;   // extra turn scale on top of TURN_SCALE (WiFi: tt<value>)
+const int   SIDE_WALL_RAW = 185;   // L/R raw below this = wall (maze test: walls <= 150, open >= 223)
 const int   FRONT_WALL_RAW   = 120; // F raw below this at a cell centre = wall ahead
 const int   DIAG_WALL_RAW    = 95;  // LF/RF raw below this at a cell centre = wall ahead
 const int   FRONT_ABORT_RAW  = 60;  // unexpected wall this close while moving -> stop
@@ -327,12 +330,12 @@ bool forwardMm(float mm) {
     if (remainingMm < SLOW_MM) base = MIN_PWM + (MAX_PWM - MIN_PWM) * remainingMm / SLOW_MM;
 
     // Centring: positive error = robot is right of centre -> steer left
-    bool leftWall  = tofRaw[S_L] < sideRefL + SIDE_WALL_MARGIN;
-    bool rightWall = tofRaw[S_R] < sideRefR + SIDE_WALL_MARGIN;
+    bool leftWall  = tofRaw[S_L] < SIDE_WALL_RAW;
+    bool rightWall = tofRaw[S_R] < SIDE_WALL_RAW;
     float correction;
     if (leftWall && rightWall) {
       float err = (tofRaw[S_L] - sideRefL) - (tofRaw[S_R] - sideRefR);
-      correction = KP_WALL * err / 2.0f;
+      correction = kpWall * err / 2.0f;
       usingWalls = true;
     } else {
       if (usingWalls) { encOffset = l - r; usingWalls = false; }
@@ -347,32 +350,178 @@ bool forwardMm(float mm) {
   return true;
 }
 
-// Turn in place. Positive = right. Returns false if stopped.
+// =========================================================================
+// GYRO (MPU6050 at 0x68) - measures the real turn angle, wheel slip or not
+// =========================================================================
+const uint8_t MPU_ADDR = 0x68;
+const float GYRO_LSB_PER_DPS = 65.5f;   // +-500 deg/s range
+bool gyroOk = false;
+uint8_t gyroAxis = 2;     // axis pointing up (found from gravity at start)
+float gyroBias = 0;       // raw reading when still
+float gyroBrakeDeg = 4.7f; // degrees it keeps turning after braking (tuned: 4 x 90 within 3 deg) (WiFi: gb<value>)
+bool useGyroTurns = true;  // turn on the gyro (encoder turns slip 79-95 deg) (WiFi: gyro / enc)
+
+void mpuWrite(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+bool mpuRead(uint8_t reg, uint8_t *buf, uint8_t n) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(MPU_ADDR, n) != n) return false;
+  for (int i = 0; i < n; i++) buf[i] = Wire.read();
+  return true;
+}
+
+float readGyroRaw() {
+  uint8_t b[2];
+  if (!mpuRead(0x43 + 2 * gyroAxis, b, 2)) return gyroBias;
+  return (int16_t)((b[0] << 8) | b[1]);
+}
+
+// Robot must be still
+void calibrateGyro() {
+  if (!gyroOk) return;
+  float sum = 0;
+  for (int i = 0; i < 400; i++) {
+    sum += readGyroRaw();
+    delay(2);
+  }
+  gyroBias = sum / 400;
+  logf("Gyro zeroed (bias %.2f deg/s)\n", gyroBias / GYRO_LSB_PER_DPS);
+}
+
+void initGyro() {
+  mpuWrite(0x6B, 0x00);  // wake up
+  delay(100);
+  mpuWrite(0x1A, 0x03);  // low-pass filter ~44 Hz
+  mpuWrite(0x1B, 0x08);  // +-500 deg/s
+  uint8_t a[6];
+  gyroOk = mpuRead(0x3B, a, 6);
+  if (!gyroOk) {
+    logf("Gyro NOT found - turns use encoders only\n");
+    return;
+  }
+  // The axis that feels gravity is the one pointing up = the turning axis
+  int16_t acc[3];
+  for (int i = 0; i < 3; i++) acc[i] = (int16_t)((a[2 * i] << 8) | a[2 * i + 1]);
+  gyroAxis = 0;
+  for (int i = 1; i < 3; i++)
+    if (abs(acc[i]) > abs(acc[gyroAxis])) gyroAxis = i;
+  logf("Gyro OK, turning axis = %c (accel %d %d %d)\n", 'X' + gyroAxis, acc[0], acc[1], acc[2]);
+  calibrateGyro();
+}
+
+// Turn in place using the gyro. Positive = right. Returns false if stopped.
+bool turnEncoders(float deg);
+
 bool turnDegrees(float deg) {
+  if (!gyroOk || !useGyroTurns) return turnEncoders(deg);
   const int dir = deg >= 0 ? 1 : -1;
-  const int32_t counts = lroundf(fabsf(deg) / 90.0f * COUNTS_PER_90_TURN);
-  const float target = counts - TURN_BRAKE_LEAD;
+  const float target = fabsf(deg) - gyroBrakeDeg;
+  float angle = 0;
   zeroCounts();
   unsigned long t0 = millis();
+  unsigned long last = micros();
 
   while (true) {
     if (checkAbort()) { brakeStop(); logf("STOP requested\n"); return false; }
+    unsigned long now = micros();
+    angle += (readGyroRaw() - gyroBias) / GYRO_LSB_PER_DPS * (now - last) / 1e6f;
+    last = now;
+    float remaining = target - fabsf(angle);
+    if (remaining <= 0) break;
+    if (millis() - t0 > 4000) { brakeStop(); logf("TIMEOUT in turn\n"); return false; }
+
+    // Slow down for the last 25 degrees
+    int base = TURN_PWM;
+    if (remaining < 25) base = MIN_PWM + (TURN_PWM - MIN_PWM) * remaining / 25;
+
+    // Keep both wheels turning the same amount
+    int32_t l, r;
+    readCounts(l, r);
+    int correction = KP_STRAIGHT * (dir * l + dir * r);
+    setMotorLeft(dir * (base - correction));
+    setMotorRight(-dir * (base + correction));
+    delayMicroseconds(500);
+  }
+
+  // Brake, but keep measuring so we see the real final angle
+  brake();
+  unsigned long tb = millis();
+  while (millis() - tb < 300) {
+    unsigned long now = micros();
+    angle += (readGyroRaw() - gyroBias) / GYRO_LSB_PER_DPS * (now - last) / 1e6f;
+    last = now;
+    delayMicroseconds(500);
+  }
+  stopMotors();
+
+  int32_t l, r;
+  readCounts(l, r);
+  float encDeg = (dir * l - dir * r) / 2.0f / COUNTS_PER_90_TURN * 90.0f;
+  logf("Turn %+.0f: gyro %.1f deg | encoders say %.1f deg\n", deg, fabsf(angle), encDeg);
+  return true;
+}
+
+// Turn in place on encoder counts only (fallback). Positive = right.
+// The gyro only measures here, so we can see how far the robot really turned.
+bool turnEncoders(float deg) {
+  const int dir = deg >= 0 ? 1 : -1;
+  const int32_t counts = lroundf(fabsf(deg) / 90.0f * COUNTS_PER_90_TURN * turnTrim);
+  const float target = counts - TURN_BRAKE_LEAD;
+  float angle = 0;
+  zeroCounts();
+  unsigned long t0 = millis();
+  unsigned long last = micros();
+
+  while (true) {
+    if (checkAbort()) { brakeStop(); logf("STOP requested\n"); return false; }
+    if (gyroOk) {
+      unsigned long now = micros();
+      angle += (readGyroRaw() - gyroBias) / GYRO_LSB_PER_DPS * (now - last) / 1e6f;
+      last = now;
+    }
     int32_t l, r;
     readCounts(l, r);
     int32_t pl = dir * l;
     int32_t pr = -dir * r;
-    float remaining = target - (pl + pr) / 2.0f;
+    float done = (pl + pr) / 2.0f;
+    float remaining = target - done;
     if (remaining <= 0) break;
     if (millis() - t0 > 4000) { brakeStop(); logf("TIMEOUT in turn\n"); return false; }
 
+    // Gentle start (first 20%) and slow down (last 20%) to avoid wheel slip
     int base = TURN_PWM;
+    if (done < counts * 0.2f) base = MIN_PWM + (TURN_PWM - MIN_PWM) * done / (counts * 0.2f);
     if (remaining < counts * 0.2f) base = MIN_PWM + (TURN_PWM - MIN_PWM) * remaining / (counts * 0.2f);
     int correction = KP_STRAIGHT * (pl - pr);
     setMotorLeft(dir * (base - correction));
     setMotorRight(-dir * (base + correction));
-    delay(2);
+    delay(1);
   }
-  brakeStop();
+
+  brake();
+  unsigned long tb = millis();
+  while (millis() - tb < 300) {
+    if (gyroOk) {
+      unsigned long now = micros();
+      angle += (readGyroRaw() - gyroBias) / GYRO_LSB_PER_DPS * (now - last) / 1e6f;
+      last = now;
+    }
+    delay(1);
+  }
+  stopMotors();
+
+  int32_t l, r;
+  readCounts(l, r);
+  float encDeg = (dir * l - dir * r) / 2.0f / (COUNTS_PER_90_TURN * turnTrim) * 90.0f;
+  if (gyroOk) logf("Turn %+.0f: encoders %.1f deg | gyro measured %.1f deg\n", deg, encDeg, fabsf(angle));
+  else        logf("Turn %+.0f: encoders %.1f deg (no gyro)\n", deg, encDeg);
   return true;
 }
 
@@ -389,8 +538,8 @@ struct Walls { bool left, front, right; int raw[5]; };
 Walls readWalls() {
   Walls w;
   readToFAveraged(w.raw);
-  w.left  = w.raw[S_L] < sideRefL + SIDE_WALL_MARGIN;
-  w.right = w.raw[S_R] < sideRefR + SIDE_WALL_MARGIN;
+  w.left  = w.raw[S_L] < SIDE_WALL_RAW;
+  w.right = w.raw[S_R] < SIDE_WALL_RAW;
   w.front = w.raw[S_F] < FRONT_WALL_RAW ||
             (w.raw[S_LF] < DIAG_WALL_RAW && w.raw[S_RF] < DIAG_WALL_RAW);
   return w;
@@ -424,6 +573,7 @@ void resetPosition() {
 
 // Side sensors with the robot at the start placement (walls left and right)
 void calibrate() {
+  calibrateGyro();
   int raw[5];
   readToFAveraged(raw, 10);
   logf("Calibration raw: L %d LF %d F %d RF %d R %d\n", raw[S_L], raw[S_LF], raw[S_F], raw[S_RF], raw[S_R]);
@@ -433,7 +583,7 @@ void calibrate() {
   }
   sideRefL = raw[S_L];
   sideRefR = raw[S_R];
-  logf("Side refs: L %d, R %d (wall if raw < ref + %d)\n", sideRefL, sideRefR, SIDE_WALL_MARGIN);
+  logf("Side refs (centre): L %d, R %d. Wall if raw < %d\n", sideRefL, sideRefR, SIDE_WALL_RAW);
 }
 
 // =========================================================================
@@ -532,6 +682,7 @@ void setup() {
 
   delay(300);
   initToF();
+  initGyro();
   setupWiFi();
   Serial.println("Maze test ready: BTN1 = auto run, BTN2 = stop");
 }
@@ -555,6 +706,54 @@ void loop() {
       logf("raw L %d LF %d F %d RF %d R %d\n", raw[S_L], raw[S_LF], raw[S_F], raw[S_RF], raw[S_R]);
     }
     else if (cmd == "p") resetPosition();
+    else if (cmd.startsWith("tt") && cmd.substring(2).toFloat() > 0.5f) {
+      turnTrim = cmd.substring(2).toFloat();
+      logf("Turn trim = %.3f (90 deg = %.0f counts per wheel)\n", turnTrim, COUNTS_PER_90_TURN * turnTrim);
+    }
+    else if (cmd.startsWith("kw")) {
+      kpWall = cmd.substring(2).toFloat();
+      logf("Wall centring gain = %.2f%s\n", kpWall, kpWall == 0 ? " (OFF - encoders only)" : "");
+    }
+    else if (cmd == "gd") {
+      // Gyro diagnostic: chip id, settings, raw readings while still
+      uint8_t who = 0, cfg = 0, gcfg = 0, pwr = 0;
+      mpuRead(0x75, &who, 1);
+      mpuRead(0x1A, &cfg, 1);
+      mpuRead(0x1B, &gcfg, 1);
+      mpuRead(0x6B, &pwr, 1);
+      logf("WHO_AM_I 0x%02X (MPU6050 = 0x68, MPU6500 = 0x70, MPU9250 = 0x71) | CONFIG 0x%02X GYRO_CONFIG 0x%02X PWR 0x%02X\n",
+           who, cfg, gcfg, pwr);
+      for (int i = 0; i < 8; i++) {
+        uint8_t b[6];
+        if (mpuRead(0x43, b, 6))
+          logf("  gyro raw X %6d  Y %6d  Z %6d\n", (int16_t)((b[0] << 8) | b[1]),
+               (int16_t)((b[2] << 8) | b[3]), (int16_t)((b[4] << 8) | b[5]));
+        else
+          logf("  read failed\n");
+        delay(100);
+      }
+    }
+    else if (cmd == "gyro") { useGyroTurns = true;  logf("Turns now use the GYRO\n"); }
+    else if (cmd == "enc")  { useGyroTurns = false; logf("Turns now use the ENCODERS (gyro only measures)\n"); }
+    else if (cmd.startsWith("gb")) {
+      gyroBrakeDeg = cmd.substring(2).toFloat();
+      logf("Gyro brake lead = %.1f deg\n", gyroBrakeDeg);
+    }
+    else if (cmd == "y") {
+      // Gyro check: drift over 2 s while still (should be close to 0)
+      float angle = 0;
+      unsigned long last = micros(), t0 = millis();
+      while (millis() - t0 < 2000) {
+        unsigned long now = micros();
+        angle += (readGyroRaw() - gyroBias) / GYRO_LSB_PER_DPS * (now - last) / 1e6f;
+        last = now;
+        delay(2);
+      }
+      logf("Gyro %s, axis %c, drift %.2f deg in 2 s (keep robot still)\n",
+           gyroOk ? "OK" : "MISSING", 'X' + gyroAxis, angle);
+    }
+    else if (cmd == "?") logf("gyro %s | gyro brake %.1f | turn trim %.3f (encoder turns) | wall gain %.2f | side refs L %d R %d\n",
+                              gyroOk ? "ON" : "OFF", gyroBrakeDeg, turnTrim, kpWall, sideRefL, sideRefR);
     else if (cmd == "x") logf("Nothing running\n");
     else logf("Unknown. g=auto c=calib f=fwd r/l=turn b=180 w=walls s=sensors p=reset x=stop\n");
   }

@@ -26,7 +26,10 @@ User prefers small practical steps and short explanations.
 ## Geometry (cad/micromouse_assembly.step)
 - Wheel D 34 mm (CAD), track width 75.3 mm, robot 84 x 100 mm, maze cell 180 mm.
 - 0.0385 mm/count (distance checked on the floor), ~4672 counts per cell.
-- 90 deg turn: TURN_SCALE 1.14 (tuned on the floor) -> ~1750 counts per wheel.
+- 90 deg turn: TURN_SCALE 1.14 (tuned on the floor) -> ~1750 counts per wheel. Encoder-only turns
+  are NOT repeatable on the maze base (wheel slip: real angle 79-95 deg for the same counts).
+- **Turns use the gyro** (MPU6050, Z axis, +-500 dps): gyroBrakeDeg 4.7 -> 4 x 90 within +-3 deg.
+  Gyro must be zeroed while the robot is still (done at boot and by `c`; moved robot -> bad drift).
 - L/R sensors read ~49 mm to the walls when centred in a cell.
 
 ## Motor characterization (wheels in the air, 2026-10-28, repeated with 2 s steps - same)
@@ -44,8 +47,8 @@ User prefers small practical steps and short explanations.
 - Start placement: back against the back wall -> axle 58 mm behind cell centre (CAD).
 
 ## Status (2026-10-28)
-- Done: encoders, ToF check, motor directions, straight drive distance, 90 deg turns,
-  motor characterization.
-- Ready, NOT yet run: examples/09 maze test (BTN1 = left-hand run S..6..S, BTN2 / x = stop).
-  Wall thresholds (FRONT_WALL_RAW 120, DIAG_WALL_RAW 95, side ref + 60) are estimates -> check
-  the raw values it logs in each cell and adjust.
+- Done: encoders, ToF check, motor directions, straight drive distance, motor characterization,
+  gyro turns. Maze test (examples/09) driven step by step over WiFi: all cells' walls read right.
+- Side walls: fixed threshold SIDE_WALL_RAW 185 (walls <= 150 raw, open >= 223 raw).
+- Next: full auto run with BTN1 (left-hand, S..6..S) with gyro turns.
+- Robot IP on the hotspot changes (seen .209, .238): scan 192.168.137.x port 23 if not found.
