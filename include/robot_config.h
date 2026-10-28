@@ -24,4 +24,6 @@ const float CELL_SIZE_MM      = 180.0f;
 const float MM_PER_COUNT_L = PI * WHEEL_DIAMETER_MM / CPR_LEFT;    // ~0.0385
 const float MM_PER_COUNT_R = PI * WHEEL_DIAMETER_MM / CPR_RIGHT;
 const float COUNTS_PER_CELL = CELL_SIZE_MM / (PI * WHEEL_DIAMETER_MM) * CPR_LEFT;  // ~4672
-const float COUNTS_PER_90_TURN = (PI * TRACK_WIDTH_MM / 4.0f) / (PI * WHEEL_DIAMETER_MM) * CPR_LEFT;  // ~1535
+// Tuned on the floor: 4 x 90 deg turns should end where they started (tyre slip)
+const float TURN_SCALE = 1.14f;
+const float COUNTS_PER_90_TURN = (PI * TRACK_WIDTH_MM / 4.0f) / (PI * WHEEL_DIAMETER_MM) * CPR_LEFT * TURN_SCALE;  // ~1719

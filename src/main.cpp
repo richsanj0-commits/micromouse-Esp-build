@@ -1,15 +1,15 @@
 // =========================================================================
-// DRIVE DISTANCE TEST
-//   BTN1 (GPIO 13) -> both wheels FORWARD 2000 counts (~77 mm)
-//   BTN2 (GPIO 4)  -> both wheels BACKWARD 2000 counts (back to start)
-// Waits 1 s after the press so your hand is clear, then drives straight
-// (keeps left/right counts equal), slows down near the end and brakes.
+// TURN TEST (90 deg on the spot)
+//   BTN1 (GPIO 13) -> turn RIGHT 90 deg
+//   BTN2 (GPIO 4)  -> turn LEFT 90 deg
+// Waits 1 s after the press so your hand is clear, then turns, keeping
+// both wheels equal, slows down near the end and brakes.
 //
 // WIRELESS: joins the "alienware" hotspot. Output goes to USB serial AND to
 // a WiFi terminal on port 23 (no cable needed):
 //   pio device monitor --port socket://micromouse.local:23
 // Commands over WiFi or USB (type + Enter):
-//   1 = fwd 2000 counts   2 = back 2000 counts   c<n> = n counts (c-500 = back)   d<mm> = mm
+//   r = right 90   l = left 90   a<deg> = any angle (a-180 = left 180)   1/2 = fwd/back 2000 counts
 // =========================================================================
 #include <Arduino.h>
 #include <WiFi.h>
@@ -276,6 +276,65 @@ void driveDistance(float mm) {
   driveCounts(lroundf(mm / MM_PER_COUNT_L));
 }
 
+// --- TURN IN PLACE ---
+const int TURN_PWM = 80;
+const int TURN_BRAKE_LEAD = 40;  // counts each wheel slides after braking
+
+// Positive degrees = turn right (left wheel forward, right wheel backward)
+void turnDegrees(float deg) {
+  const int dir = deg >= 0 ? 1 : -1;
+  const int32_t counts = lroundf(fabsf(deg) / 90.0f * COUNTS_PER_90_TURN);
+  const float target = counts - TURN_BRAKE_LEAD;
+  logf("\nTurning %s %.0f deg (%ld counts per wheel)...\n", dir > 0 ? "RIGHT" : "LEFT",
+       fabsf(deg), (long)counts);
+  zeroCounts();
+  unsigned long t0 = millis();
+
+  while (true) {
+    int32_t l, r;
+    readCounts(l, r);
+    int32_t pl = dir * l;    // progress of each wheel, positive while turning
+    int32_t pr = -dir * r;
+
+    if (millis() - t0 > 300 && (pl < -50 || pr < -50)) {
+      stopMotors();
+      logf("STOPPED: %s wheel runs the wrong way\n", pl < -50 ? "LEFT" : "RIGHT");
+      return;
+    }
+
+    float travelled = (pl + pr) / 2.0f;
+    float remaining = target - travelled;
+    if (remaining <= 0) break;
+
+    if (millis() - t0 > 4000) {
+      stopMotors();
+      logf("TIMEOUT: turn did not finish\n");
+      return;
+    }
+
+    // Slow down for the last 20%
+    int base = TURN_PWM;
+    if (remaining < counts * 0.2f)
+      base = MIN_PWM + (TURN_PWM - MIN_PWM) * remaining / (counts * 0.2f);
+
+    // Keep both wheels turning the same amount
+    int correction = KP_STRAIGHT * (pl - pr);
+    setMotorLeft(dir * (base - correction));
+    setMotorRight(-dir * (base + correction));
+    delay(2);
+  }
+
+  brake();
+  delay(300);
+  stopMotors();
+
+  int32_t l, r;
+  readCounts(l, r);
+  float turned = (dir * l - dir * r) / 2.0f / COUNTS_PER_90_TURN * 90.0f;
+  logf("Done: L %+ld | R %+ld counts (target %ld each) = %.1f deg\n\n",
+       (long)l, (long)r, (long)counts, dir * turned);
+}
+
 // Run each motor alone briefly with a "forward" command and report which
 // encoder moved and in which direction (forward = positive counts)
 void motorCheck() {
@@ -329,20 +388,23 @@ void setup() {
   pinMode(BTN2, INPUT_PULLUP);
 
   setupWiFi();
-  Serial.println("Drive test ready: BTN1 = forward 2000 counts, BTN2 = backward 2000 counts");
+  Serial.println("Turn test ready: BTN1 = right 90, BTN2 = left 90");
 }
 
 void loop() {
-  if (buttonPressed(BTN1)) { delay(1000); driveCounts(2000); }
-  if (buttonPressed(BTN2)) { delay(1000); driveCounts(-2000); }
+  if (buttonPressed(BTN1)) { delay(1000); turnDegrees(90); }
+  if (buttonPressed(BTN2)) { delay(1000); turnDegrees(-90); }
 
   String cmd;
   if (readCommand(cmd)) {
-    if (cmd == "1") driveCounts(2000);
+    if (cmd == "r") turnDegrees(90);
+    else if (cmd == "l") turnDegrees(-90);
+    else if (cmd.startsWith("a") && cmd.substring(1).toFloat() != 0) turnDegrees(cmd.substring(1).toFloat());
+    else if (cmd == "1") driveCounts(2000);
     else if (cmd == "2") driveCounts(-2000);
     else if (cmd.startsWith("c") && cmd.substring(1).toInt() != 0) driveCounts(cmd.substring(1).toInt());
     else if (cmd == "t") motorCheck();
     else if (cmd.startsWith("d") && cmd.substring(1).toFloat() > 0) driveDistance(cmd.substring(1).toFloat());
-    else logf("Unknown command. Use 1, 2 or d<mm> (e.g. d120)\n");
+    else logf("Unknown command. Use r, l, a<deg>, 1, 2, c<counts>, d<mm>, t\n");
   }
 }
