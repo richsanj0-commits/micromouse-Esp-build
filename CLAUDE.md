@@ -11,7 +11,7 @@ User prefers small practical steps and short explanations.
 - Shared values: `include/robot_config.h`. Web telemetry build: `apexweb.cpp` (encoder pins there are old).
 - WiFi credentials: `include/wifi_secrets.h` (gitignored; template `wifi_secrets.example.h`).
 - Upload over USB (COM9 on this PC), then unplug and monitor over WiFi:
-  robot joins the "alienware" hotspot, IP 192.168.137.209, port 23
+  robot joins the PC hotspot (now "Richas-lap", was "alienware"), IP 192.168.137.209, port 23
   (`pio device monitor --port socket://192.168.137.209:23`).
 
 ## Hardware (all verified on the robot)
@@ -47,6 +47,10 @@ User prefers small practical steps and short explanations.
   nose only ~7 mm from a front wall (F unreliable that close -> LF/RF decide front walls).
 - Start placement: back against the back wall -> axle 58 mm behind cell centre (CAD).
 
+## Current maze (2026-10-29)
+- User's own 10x10 maze, layout unknown to us (user keeps it secret). Cell given as "16-17 cm"
+  (not yet clear if corridor or pitch; code still uses 180 mm pitch). PC hotspot now "Richas-lap".
+
 ## Maze solver (examples/10, 2026-10-28) - works on the robot
 - BTN1 / `g`: explore (depth-first, prefers left/front/right) and record a wall map until an open
   2x2 block (no inner walls, not the start) is found = goal, then back to start on the shortest known path.
@@ -60,6 +64,15 @@ User prefers small practical steps and short explanations.
 - ToF readings cleared at the start of each move (stale F 53 from the last run used to block the start).
 - Wheel slip on turns is large (wheels 100-230 deg for 90 deg) - gyro handles it.
 - A hole/gap in the floor makes the wheels spin -> position lost. Keep the floor flat.
+
+## Tests on the user's maze (2026-10-29)
+- Pushed solver code (cfd5b5b) ran the user's maze correctly 2 times with BTN1/BTN2 - keep it.
+- Seen problems: "stuck in turn" when a corner catches a wall (robot off-centre / placed touching a
+  wall; only a few mm clearance on in-place turns). Hand in front -> "unexpected wall ahead" (correct).
+- Goal = FIRST open 2x2 (all 4 cells visited, no inner walls, not the start). Other open spaces are
+  skipped if found later or not fully visited. Idea: goal = maze centre (10x10 known, start in a corner).
+- Untested local fixes (not committed): start facing a wall -> turn around; stuck turn -> back up
+  20 mm and retry (max 3), gyro read error count.
 
 ## Status (2026-10-28)
 - Done: all hardware, gyro turns, wall following, explore + 2x2 goal + flood-fill fast run.
