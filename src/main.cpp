@@ -46,24 +46,24 @@ void logf(const char *fmt, ...) {
   if (telnet && telnet.connected()) telnet.print(buf);
 }
 
+// WiFi connects in the background - never blocks the buttons
 void setupWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(HOSTNAME);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.printf("WiFi: connecting to %s", WIFI_SSID);
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
-    delay(250);
-    Serial.print(".");
-  }
-  if (WiFi.status() == WL_CONNECTED) {
+  telnetServer.begin();
+  telnetServer.setNoDelay(true);
+  Serial.printf("WiFi: connecting to %s in the background\n", WIFI_SSID);
+}
+
+// Called from loop(): print the IP once when WiFi comes up
+void checkWiFi() {
+  static bool announced = false;
+  if (!announced && WiFi.status() == WL_CONNECTED) {
+    announced = true;
     MDNS.begin(HOSTNAME);
-    telnetServer.begin();
-    telnetServer.setNoDelay(true);
-    Serial.printf("\nWiFi OK: %s  (telnet port 23, %s.local)\n",
-                  WiFi.localIP().toString().c_str(), HOSTNAME);
-  } else {
-    Serial.println("\nWiFi not found - buttons still work, output on USB only");
+    Serial.printf("WiFi OK: %s  (telnet port 23, %s.local)\n", WiFi.localIP().toString().c_str(), HOSTNAME);
   }
 }
 
@@ -79,6 +79,7 @@ void setupWiFi() {
 // Buttons
 #define BTN1 13
 #define BTN2 4
+#define LED_PIN 2   // blue LED on the ESP32 board: on = button press registered / run going
 
 // ToF (order: L, LF, F, RF, R)
 #define I2C_SDA 21
@@ -335,9 +336,11 @@ bool mpuRead(uint8_t reg, uint8_t *buf, uint8_t n) {
   return true;
 }
 
+int gyroFails = 0;   // failed gyro reads (I2C), shown in the stuck message
+
 float readGyroRaw() {
   uint8_t b[2];
-  if (!mpuRead(0x43 + 2 * gyroAxis, b, 2)) return gyroBias;
+  if (!mpuRead(0x43 + 2 * gyroAxis, b, 2)) { gyroFails++; return gyroBias; }
   return (int16_t)((b[0] << 8) | b[1]);
 }
 
@@ -409,6 +412,9 @@ bool turnDegrees(float deg) {
   const float stopAt = fabsf(needed) - gyroBrakeDeg;
   zeroCounts();
   unsigned long t0 = millis();
+  int retries = 0;
+  float turnedAtZero = 0;   // robot angle when the wheel counts were last zeroed
+  gyroFails = 0;
 
   while (true) {
     if (checkAbort()) { brakeStop(); logf("STOP requested\n"); return false; }
@@ -416,16 +422,33 @@ bool turnDegrees(float deg) {
     float turned = fabsf(yaw - startYaw);          // works even if yawSign is wrong
     float remaining = stopAt - turned;
     if (remaining <= 0) break;
-    if (millis() - t0 > 4000) { brakeStop(); logf("TIMEOUT in turn\n"); return false; }
+    if (millis() - t0 > 6000) { brakeStop(); logf("TIMEOUT in turn\n"); return false; }
 
-    // Wheels spinning far more than the robot turns = stuck on a wall
+    // Wheels spinning far more than the robot turns = a corner caught on a wall
     int32_t l, r;
     readCounts(l, r);
     float encDeg = (dir * l - dir * r) / 2.0f / COUNTS_PER_90_TURN * 90.0f;
-    if (encDeg > 2.0f * fabsf(needed) + 30) {
+    if (encDeg > 1.6f * (turned - turnedAtZero) + 90) {   // normal slip: wheels 100-230 for a 90
       brakeStop();
-      logf("STOP: stuck in turn (wheels %.0f deg, robot %.0f deg)\n", encDeg, turned);
-      return false;
+      logf("Stuck in turn (wheels %.0f deg, robot %.0f deg, gyro errors %d)", encDeg, turned - turnedAtZero, gyroFails);
+      if (++retries > 3) { logf(" - STOP\n"); return false; }
+      logf(" - backing up 20 mm, retry %d\n", retries);
+      // Back straight up a little to free the corner, then carry on turning
+      zeroCounts();
+      unsigned long tb = millis();
+      while (millis() - tb < 1000) {
+        readCounts(l, r);
+        if ((l + r) / 2.0f * MM_PER_COUNT_L < -20) break;
+        setMotorLeft(-(MIN_PWM + 10));
+        setMotorRight(-(MIN_PWM + 10));
+        updateYaw();
+        delay(2);
+      }
+      brakeStop();
+      updateYaw();
+      zeroCounts();
+      turnedAtZero = fabsf(yaw - startYaw);
+      continue;
     }
 
     // Slow down for the last 25 degrees
@@ -662,7 +685,7 @@ void calibrate() {
 
 // =========================================================================
 // MAZE MAP + RUNS
-// Explore (BTN1 / g): depth-first into unvisited cells (right, front, left
+// Explore (BTN1 / g): depth-first into unvisited cells (left, front, right
 //   first), recording walls, until an open 2x2 block (the goal) is found.
 //   Then back to the start on the shortest known path.
 // Fast run (BTN2 / fr): flood fill over explored cells only, start -> goal,
@@ -809,20 +832,27 @@ void exploreRun() {
     if (moves >= 300) { logf("=== 300 moves reached, stopping ===\n\n"); return; }
     Walls w = readWalls();
     printWalls(w);
-    recordWalls(w, moves == 0);   // start cell: back against a wall
+    // Start facing a wall (walls L, F, R) -> the opening must be behind
+    bool startBoxed = moves == 0 && w.left && w.front && w.right;
+    recordWalls(w, moves == 0 && !startBoxed);   // start cell: back against a wall (normally)
     if (checkGoal()) {
       logf("GOAL found: 2x2 from (%d,%d) to (%d,%d) after %d moves, %.1f s\n",
            goalX, goalY, goalX + 1, goalY + 1, moves, (millis() - t0) / 1000.0f);
       break;
     }
 
-    // Open neighbours not yet visited, in order RIGHT, front, left (right-hand priority)
+    // Open neighbours not yet visited, in order left, front, right
     int next = -1;
-    const int rel[3] = {1, 0, 3};
-    const bool wall[3] = {w.right, w.front, w.left};
+    const int rel[3] = {3, 0, 1};
+    const bool wall[3] = {w.left, w.front, w.right};
     for (int i = 0; i < 3 && next < 0; i++) {
       int d = (heading + rel[i]) % 4;
       if (!wall[i] && inGrid(posX + DX[d], posY + DY[d]) && !isVisited(posX + DX[d], posY + DY[d])) next = d;
+    }
+    if (startBoxed) {
+      logf("Start facing a wall -> turning around\n");
+      atStartOffset = false;   // not backed onto a wall, so no start offset to drive first
+      next = (heading + 2) % 4;
     }
 
     bool ok;
@@ -895,6 +925,7 @@ bool buttonPressed(int pin) {
   if (digitalRead(pin) == LOW) {
     delay(50); // Debounce
     if (digitalRead(pin) == LOW) {
+      digitalWrite(LED_PIN, HIGH);   // press registered
       while (digitalRead(pin) == LOW) delay(10);
       return true;
     }
@@ -927,6 +958,8 @@ void setup() {
 
   pinMode(BTN1, INPUT_PULLUP);
   pinMode(BTN2, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
   delay(300);
   initToF();
@@ -937,8 +970,9 @@ void setup() {
 
 void loop() {
   updateYaw();
-  if (buttonPressed(BTN1)) { delay(1000); exploreRun(); }
-  if (buttonPressed(BTN2)) { delay(1000); fastRun(); }   // while a run is going BTN2 = stop
+  checkWiFi();
+  if (buttonPressed(BTN1)) { digitalWrite(LED_PIN, HIGH); delay(1000); exploreRun(); digitalWrite(LED_PIN, LOW); }
+  if (buttonPressed(BTN2)) { digitalWrite(LED_PIN, HIGH); delay(1000); fastRun(); digitalWrite(LED_PIN, LOW); }   // while a run is going BTN2 = stop
 
   String cmd;
   if (readCommand(cmd)) {

@@ -7,7 +7,9 @@ User prefers small practical steps and short explanations.
 - `src/main.cpp` = active sketch (swapped per test). Saved tests in `examples/`:
   01 motor, 02 ToF (old), 03 encoder (old), 04 encoder CPR calibration, 05 ToF test,
   06 drive test, 07 turn test, 08 motor characterization, 09 maze test,
-  10 maze solver with flood fill (= current main.cpp).
+  10 maze solver (older, NOT the good one), 11 **BEST maze solver (ran the user's 10x10 in the video
+  7-8 times - always use this)**, 12 right-hand priority (failed: hit walls), 13 = 11 + button fix
+  (= current main.cpp).
 - Shared values: `include/robot_config.h`. Web telemetry build: `apexweb.cpp` (encoder pins there are old).
 - WiFi credentials: `include/wifi_secrets.h` (gitignored; template `wifi_secrets.example.h`).
 - Upload over USB (COM9 on this PC), then unplug and monitor over WiFi:
@@ -71,8 +73,11 @@ User prefers small practical steps and short explanations.
   wall; only a few mm clearance on in-place turns). Hand in front -> "unexpected wall ahead" (correct).
 - Goal = FIRST open 2x2 (all 4 cells visited, no inner walls, not the start). Other open spaces are
   skipped if found later or not fully visited. Idea: goal = maze centre (10x10 known, start in a corner).
-- Untested local fixes (not committed): start facing a wall -> turn around; stuck turn -> back up
-  20 mm and retry (max 3), gyro read error count.
+- **BEST code = examples/11** (= solver + start facing a wall -> turn around + stuck turn -> back up
+  20 mm and retry). The user uploaded it from main.cpp on 2026-10-29 and it ran perfectly (video).
+  2026-10-31: I wrongly uploaded examples/10 -> robot misbehaved. Never swap the base code again.
+- examples/13 (2026-10-31): BEST + buttons work right after power-on (WiFi in background, was
+  blocking 8 s) + blue LED (GPIO 2) on when a press registers / during a run.
 
 ## Status (2026-10-28)
 - Done: all hardware, gyro turns, wall following, explore + 2x2 goal + flood-fill fast run.
