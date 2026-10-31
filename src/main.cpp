@@ -662,7 +662,7 @@ void calibrate() {
 
 // =========================================================================
 // MAZE MAP + RUNS
-// Explore (BTN1 / g): depth-first into unvisited cells (left, front, right
+// Explore (BTN1 / g): depth-first into unvisited cells (right, front, left
 //   first), recording walls, until an open 2x2 block (the goal) is found.
 //   Then back to the start on the shortest known path.
 // Fast run (BTN2 / fr): flood fill over explored cells only, start -> goal,
@@ -816,10 +816,10 @@ void exploreRun() {
       break;
     }
 
-    // Open neighbours not yet visited, in order left, front, right
+    // Open neighbours not yet visited, in order RIGHT, front, left (right-hand priority)
     int next = -1;
-    const int rel[3] = {3, 0, 1};
-    const bool wall[3] = {w.left, w.front, w.right};
+    const int rel[3] = {1, 0, 3};
+    const bool wall[3] = {w.right, w.front, w.left};
     for (int i = 0; i < 3 && next < 0; i++) {
       int d = (heading + rel[i]) % 4;
       if (!wall[i] && inGrid(posX + DX[d], posY + DY[d]) && !isVisited(posX + DX[d], posY + DY[d])) next = d;
