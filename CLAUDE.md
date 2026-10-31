@@ -12,7 +12,9 @@ User prefers small practical steps and short explanations.
   14 = 13 buttons only (no WiFi/serial), 15 PWM 120, 16 PWM 150 + one-way-in goal + no move limit,
   **17 = GOOD, LOCKED (2026-11-01): buttons only, PWM 150 (~190 rpm, ~0.34 m/s), speed ramp, slows
   for front walls, wall correction 0.3 deg/mm (half with one wall), goal = 2x2 with one way in
-  (backup: first open 2x2). User: "pakka, no major problems". Start new work from 17.**
+  (backup: first open 2x2). User: "pakka, no major problems".**
+  18/19 = PWM 180 (user: not now). **20 = LATEST GOOD (2026-11-01): 17 + front-wall fix (brakes
+  earlier, factor 0.5; LF+RF average <= 70 = backup stop). Start new work from 20.**
 - Shared values: `include/robot_config.h`. Web telemetry build: `apexweb.cpp` (encoder pins there are old).
 - WiFi credentials: `include/wifi_secrets.h` (gitignored; template `wifi_secrets.example.h`).
 - Upload over USB (COM9 on this PC), then unplug and monitor over WiFi:

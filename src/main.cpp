@@ -68,6 +68,7 @@ const int   FRONT_WALL_RAW   = 120; // F raw below this at a cell centre = wall 
 const int   DIAG_WALL_RAW    = 95;  // LF/RF raw below this at a cell centre = wall ahead
 const int   FRONT_ABORT_RAW  = 60;  // unexpected wall this close while moving -> stop
 const int   FRONT_STOP_RAW   = 55;  // F raw with the robot at a cell centre facing a wall
+const int   DIAG_STOP_RAW    = 70;  // LF+RF average this close while driving = wall ahead (backup for F)
 int sideRefL = 91;   // raw L / R with the robot centred (measured; overwritten by calibration)
 int sideRefR = 91;
 
@@ -446,6 +447,9 @@ bool forwardMm(float mm) {
     // Front wall ahead near the end: its distance decides where to stop, not the encoders
     bool frontWall = tofRaw[S_F] > 0 && tofRaw[S_F] < FRONT_WALL_RAW;
     if (nearEnd && frontWall && tofRaw[S_F] <= FRONT_STOP_RAW) break;
+    // Backup if F misses the wall (robot slightly angled): both diagonals see it close
+    // (at the normal stop point LF+RF average ~75-80; side walls alone give ~130)
+    if (nearEnd && tofRaw[S_LF] > 0 && tofRaw[S_RF] > 0 && (tofRaw[S_LF] + tofRaw[S_RF]) / 2 <= DIAG_STOP_RAW) break;
     if (remaining <= 0) {
       // Encoders say done but the front wall is still far -> creep up to it (max 60 mm extra)
       if (frontWall && tofRaw[S_F] > FRONT_STOP_RAW && -remaining * MM_PER_COUNT_L < 60) creeping = true;
@@ -468,7 +472,7 @@ bool forwardMm(float mm) {
     if (travelledMm < ACCEL_MM) base = min(base, (int)(MIN_PWM + (MAX_PWM - MIN_PWM) * travelledMm / ACCEL_MM));
     // Front wall coming: slow down with its distance, so it never slides into it
     if (tofRaw[S_F] > 0 && tofRaw[S_F] < FRONT_SLOW_RAW)
-      base = min(base, (int)(MIN_PWM + (tofRaw[S_F] - FRONT_STOP_RAW) * 0.8f));
+      base = min(base, (int)(MIN_PWM + (tofRaw[S_F] - FRONT_STOP_RAW) * 0.5f));   // 0.8 in examples/17
     if (creeping) base = MIN_PWM;
     base = max(base, MIN_PWM);
 
