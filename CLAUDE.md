@@ -8,8 +8,11 @@ User prefers small practical steps and short explanations.
   01 motor, 02 ToF (old), 03 encoder (old), 04 encoder CPR calibration, 05 ToF test,
   06 drive test, 07 turn test, 08 motor characterization, 09 maze test,
   10 maze solver (older, NOT the good one), 11 **BEST maze solver (ran the user's 10x10 in the video
-  7-8 times - always use this)**, 12 right-hand priority (failed: hit walls), 13 = 11 + button fix
-  (= current main.cpp).
+  7-8 times)**, 12 right-hand priority (failed: hit walls), 13 = 11 + button fix,
+  14 = 13 buttons only (no WiFi/serial), 15 PWM 120, 16 PWM 150 + one-way-in goal + no move limit,
+  **17 = GOOD, LOCKED (2026-11-01): buttons only, PWM 150 (~190 rpm, ~0.34 m/s), speed ramp, slows
+  for front walls, wall correction 0.3 deg/mm (half with one wall), goal = 2x2 with one way in
+  (backup: first open 2x2). User: "pakka, no major problems". Start new work from 17.**
 - Shared values: `include/robot_config.h`. Web telemetry build: `apexweb.cpp` (encoder pins there are old).
 - WiFi credentials: `include/wifi_secrets.h` (gitignored; template `wifi_secrets.example.h`).
 - Upload over USB (COM9 on this PC), then unplug and monitor over WiFi:
